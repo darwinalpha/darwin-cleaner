@@ -1,4 +1,4 @@
-"""内置步骤测试：逐个验证关键行为。"""
+"""Built-in steps: verify key behavior of each step."""
 
 import pandas as pd
 import pytest
@@ -40,9 +40,9 @@ def test_field_mapping():
 def test_value_mapping():
     df = pd.DataFrame({"s": ["Suspended", "Normal"]})
     out = value_mapping(
-        df, make_ctx(Contract(), Rules(value_map={"s": {"Suspended": "停牌"}})), {}
+        df, make_ctx(Contract(), Rules(value_map={"s": {"Suspended": "Halted"}})), {}
     )
-    assert out["s"].tolist() == ["停牌", "Normal"]
+    assert out["s"].tolist() == ["Halted", "Normal"]
 
 
 def test_field_transform_factor_and_value():

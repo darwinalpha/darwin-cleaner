@@ -1,12 +1,13 @@
 # src/darwin_cleaner/steps.py
 
 """
-库内置的 12 个通用清洗步骤。
+The 12 generic cleaning steps built into the library.
 
-从 darwin-fetch 的 middlewares/steps.py 迁移并强化：
-- 参数从 ctx.rules / ctx.contract / params 读取，不再读全局配置树；
-- 错误在严格模式下抛出，不再静默降级为 warning；
-- 新增 dedupe(70)，默认关闭。
+Migrated and hardened from darwin-fetch's middlewares/steps.py:
+- params are read from ctx.rules / ctx.contract / params, no longer from the
+  global configuration tree;
+- errors are raised in strict mode instead of silently degrading to warnings;
+- added dedupe(70), disabled by default.
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ CONSISTENCY_RULES = {
 
 
 # ============================================================
-# transform 动作
+# Transform actions
 # ============================================================
 
 def _symbol_to_standard(s: pd.Series) -> pd.Series:
@@ -158,14 +159,14 @@ def _extract_formula_fields(formula: str) -> set[str]:
 
 
 # ============================================================
-# 12 个内置步骤
+# 12 built-in steps
 # ============================================================
 
 @middleware(order=10)
 def field_mapping(
     df: pd.DataFrame, ctx: CleanContext, params: Mapping[str, Any]
 ) -> pd.DataFrame:
-    """按 ctx.rules.mapping 做字段改名。"""
+    """Rename fields according to ctx.rules.mapping."""
     mapping = ctx.rules.mapping
     if not mapping:
         return df
@@ -177,7 +178,7 @@ def field_mapping(
 def value_mapping(
     df: pd.DataFrame, ctx: CleanContext, params: Mapping[str, Any]
 ) -> pd.DataFrame:
-    """按 ctx.rules.value_map 做值替换。"""
+    """Replace values according to ctx.rules.value_map."""
     value_map = ctx.rules.value_map
     if not value_map:
         return df
@@ -191,9 +192,9 @@ def value_mapping(
 def field_transform(
     df: pd.DataFrame, ctx: CleanContext, params: Mapping[str, Any]
 ) -> pd.DataFrame:
-    """按 ctx.rules.transform 做常量赋值 / 乘法 / 动作。"""
+    """Apply constant assignment / multiplication / actions according to ctx.rules.transform."""
     actions = dict(DEFAULT_ACTIONS)
-    # 允许通过 params["actions"] 注入自定义动作（强类型 Options 的轻量替代）
+    # Allow injecting custom actions via params["actions"] (lightweight alternative to strongly typed Options)
     actions.update(params.get("actions", {}) or {})
 
     for field, spec in ctx.rules.transform.items():
@@ -204,14 +205,14 @@ def field_transform(
             continue
         if spec.kind == "factor":
             if spec.factor is None:
-                raise CleanerConfigError(f"transform factor 缺少 factor 值: {field}")
+                raise CleanerConfigError(f"transform factor is missing the factor value: {field}")
             df[field] = df[field] * spec.factor
         elif spec.kind == "action":
             if not spec.action:
-                raise CleanerConfigError(f"transform action 缺少 action 名: {field}")
+                raise CleanerConfigError(f"transform action is missing the action name: {field}")
             action = actions.get(spec.action)
             if action is None:
-                raise CleanerConfigError(f"未知 transform 动作: {spec.action}")
+                raise CleanerConfigError(f"Unknown transform action: {spec.action}")
             df[field] = action(df[field])
     return df
 
@@ -220,7 +221,7 @@ def field_transform(
 def type_conversion(
     df: pd.DataFrame, ctx: CleanContext, params: Mapping[str, Any]
 ) -> pd.DataFrame:
-    """按契约字段类型的 converter 统一 dtype。"""
+    """Unify dtypes using the converter of each contract field type."""
     for field, spec in ctx.contract.fields.items():
         if field not in df.columns:
             continue
@@ -234,7 +235,7 @@ def type_conversion(
 
 @middleware(order=30)
 def fill(df: pd.DataFrame, ctx: CleanContext, params: Mapping[str, Any]) -> pd.DataFrame:
-    """按字段的 fill 规则分组填充，统计写入 nulls_filled。"""
+    """Fill values by each field's fill rule, grouped accordingly; statistics go to nulls_filled."""
     group_field = params.get("group_field", "symbol")
     for field, spec in ctx.contract.fields.items():
         if spec.fill is None or field not in df.columns:
@@ -263,7 +264,7 @@ def fill(df: pd.DataFrame, ctx: CleanContext, params: Mapping[str, Any]) -> pd.D
 def formula_compute(
     df: pd.DataFrame, ctx: CleanContext, params: Mapping[str, Any]
 ) -> pd.DataFrame:
-    """全空列按 formula 计算；部分缺失只告警。"""
+    """Compute fully empty columns from formula; partial missing values only produce a warning."""
     for field, spec in ctx.contract.fields.items():
         if not spec.formula:
             continue
@@ -278,10 +279,10 @@ def formula_compute(
                 df[field] = _eval_formula(df, spec.formula)
                 ctx.report.bump_mapping("computed_fields", field, int(df[field].notna().sum()))
             except Exception as exc:
-                ctx.report.add_warning(f"计算 {field} 失败: {exc}")
+                ctx.report.add_warning(f"Failed to compute {field}: {exc}")
         else:
             ctx.report.add_warning(
-                f"{field}: {null_count}/{total} 行缺失，不计算（部分缺失）"
+                f"{field}: {null_count}/{total} rows missing, not computed (partial missing)"
             )
     return df
 
@@ -290,14 +291,14 @@ def formula_compute(
 def formula_validate(
     df: pd.DataFrame, ctx: CleanContext, params: Mapping[str, Any]
 ) -> pd.DataFrame:
-    """双容差校验：rel_diff 与 abs_diff 同时超才算不符。"""
+    """Dual-tolerance validation: a value is non-conforming only when both rel_diff and abs_diff exceed their limits."""
     for field, spec in ctx.contract.fields.items():
         if not spec.formula or field not in df.columns:
             continue
         required = _extract_formula_fields(spec.formula)
         missing = required - set(df.columns)
         if missing:
-            ctx.report.add_warning(f"{field}: formula 依赖字段不存在: {sorted(missing)}")
+            ctx.report.add_warning(f"{field}: formula dependency fields missing: {sorted(missing)}")
             continue
 
         type_spec = ctx.contract.types.get(spec.type)
@@ -310,13 +311,13 @@ def formula_validate(
         try:
             expected = _eval_formula(df, spec.formula)
         except Exception as exc:
-            ctx.report.add_warning(f"{field}: formula 求值失败: {exc}")
+            ctx.report.add_warning(f"{field}: formula evaluation failed: {exc}")
             continue
         if not isinstance(expected, pd.Series):
             expected = pd.Series(expected, index=df.index)
 
         if bool(expected.isin([float("inf"), float("-inf")]).any()):
-            ctx.report.add_warning(f"{field}: formula 计算出 inf，跳过验证")
+            ctx.report.add_warning(f"{field}: formula produced inf, skipping validation")
             continue
         if pd.api.types.is_bool_dtype(expected) or pd.api.types.is_bool_dtype(df[field]):
             continue
@@ -329,7 +330,7 @@ def formula_validate(
         if bad_count:
             ctx.report.bump_mapping("validated_fields", field, bad_count)
             ctx.report.add_warning(
-                f"{field}: {bad_count} 行与公式不符 (rel_tol={rel_tol}, abs_tol={abs_tol})"
+                f"{field}: {bad_count} rows do not match the formula (rel_tol={rel_tol}, abs_tol={abs_tol})"
             )
     return df
 
@@ -338,12 +339,12 @@ def formula_validate(
 def consistency(
     df: pd.DataFrame, ctx: CleanContext, params: Mapping[str, Any]
 ) -> pd.DataFrame:
-    """字段间一致性规则（如 high >= low），违规置空。"""
+    """Cross-field consistency rules (e.g. high >= low); violations are set to null."""
     for field, spec in ctx.contract.fields.items():
         for rule_name in spec.consistency:
             rule = CONSISTENCY_RULES.get(rule_name)
             if rule is None:
-                ctx.report.add_warning(f"未知一致性规则: {rule_name}")
+                ctx.report.add_warning(f"Unknown consistency rule: {rule_name}")
                 continue
             a, op, b = rule
             if a not in df.columns or b not in df.columns:
@@ -358,7 +359,7 @@ def consistency(
             bad_count = int(bad.sum())
             if bad_count:
                 ctx.report.bump_mapping("outliers_corrected", rule_name, bad_count)
-                ctx.report.add_warning(f"一致性规则 {rule_name} 违规: {bad_count} 行")
+                ctx.report.add_warning(f"Consistency rule {rule_name} violated: {bad_count} rows")
                 df[field] = df[field].mask(bad, None)
     return df
 
@@ -367,7 +368,7 @@ def consistency(
 def type_validate(
     df: pd.DataFrame, ctx: CleanContext, params: Mapping[str, Any]
 ) -> pd.DataFrame:
-    """inf / min / max 越界置空。"""
+    """Set out-of-range inf / min / max values to null."""
     for field, spec in ctx.contract.fields.items():
         if field not in df.columns:
             continue
@@ -401,18 +402,18 @@ def type_validate(
 
 @middleware(order=70, enabled=False)
 def dedupe(df: pd.DataFrame, ctx: CleanContext, params: Mapping[str, Any]) -> pd.DataFrame:
-    """按 keys 去重；默认关闭，由 params 定义重复的含义与处理方式。"""
+    """Deduplicate by keys; disabled by default; params define what constitutes a duplicate and how to handle it."""
     keys = tuple(params.get("keys") or ()) or ctx.contract.dedupe_keys()
     if not keys:
-        raise CleanerConfigError("dedupe 开启但未指定 keys：无法定义重复行")
+        raise CleanerConfigError("dedupe is enabled but no keys are specified: duplicate rows cannot be defined")
     missing = [k for k in keys if k not in df.columns]
     if missing:
-        raise CleanerConfigError(f"dedupe 的 keys 列不存在: {missing}")
+        raise CleanerConfigError(f"dedupe keys column(s) do not exist: {missing}")
 
     scope = params.get("scope", "keys")
     strategy = params.get("strategy", "first")
     if strategy not in ("first", "last", "error"):
-        raise CleanerConfigError(f"未知的 dedupe strategy: {strategy}")
+        raise CleanerConfigError(f"Unknown dedupe strategy: {strategy}")
 
     subset = list(df.columns) if scope == "all_columns" else list(keys)
     duplicated = df.duplicated(subset=subset, keep=False)
@@ -420,7 +421,7 @@ def dedupe(df: pd.DataFrame, ctx: CleanContext, params: Mapping[str, Any]) -> pd
 
     if strategy == "error":
         if n_dup:
-            raise CleanerConfigError(f"发现 {n_dup} 行重复（keys={keys}）")
+            raise CleanerConfigError(f"Found {n_dup} duplicate rows (keys={keys})")
         return df
 
     before = len(df)
@@ -430,33 +431,33 @@ def dedupe(df: pd.DataFrame, ctx: CleanContext, params: Mapping[str, Any]) -> pd
     if removed:
         ctx.report.bump_stat("duplicates_removed", removed)
         if params.get("warn", False):
-            ctx.report.add_warning(f"dedupe 移除 {removed} 行重复（strategy={strategy}）")
+            ctx.report.add_warning(f"dedupe removed {removed} duplicate rows (strategy={strategy})")
     return result
 
 
 @middleware(order=90)
 def output(df: pd.DataFrame, ctx: CleanContext, params: Mapping[str, Any]) -> pd.DataFrame:
-    """按契约 output 选列；required 缺失报错，非 required 补空。"""
+    """Select columns per contract output; missing required columns raise an error, non-required ones are filled with empty values."""
     output_fields = ctx.contract.output
     missing_def = [f for f in output_fields if f not in ctx.contract.fields]
     if missing_def:
-        raise CleanerConfigError(f"output 字段未在 fields 中定义: {missing_def}")
+        raise CleanerConfigError(f"Output fields not defined in fields: {missing_def}")
 
     warn_on_missing = bool(params.get("warn_on_missing", False))
     for field in output_fields:
         if field in df.columns:
             continue
         if ctx.contract.is_required(field):
-            raise CleanerConfigError(f"required 列缺失: {field}")
+            raise CleanerConfigError(f"Required column missing: {field}")
         df[field] = None
         if warn_on_missing:
-            ctx.report.add_warning(f"非 required 列缺失，已补空: {field}")
+            ctx.report.add_warning(f"Non-required column missing, filled with empty values: {field}")
     return df[list(output_fields)]
 
 
 @middleware(order=95)
 def sort(df: pd.DataFrame, ctx: CleanContext, params: Mapping[str, Any]) -> pd.DataFrame:
-    """按契约 sort 多字段排序。"""
+    """Sort by multiple fields in contract sort."""
     specs = ctx.contract.sort
     if not specs:
         return df

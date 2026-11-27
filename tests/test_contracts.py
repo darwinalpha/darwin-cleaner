@@ -1,4 +1,4 @@
-"""契约值对象测试：required 三态推导、唯一行键、输出顺序。"""
+"""Contract value objects: tri-state required, unique-row keys and output order."""
 
 from darwin_cleaner import Contract, FieldSpec, SortSpec, TypeSpec
 
@@ -46,7 +46,7 @@ def test_explicit_required_overrides_derivation():
         },
         keys=("symbol",),
     )
-    assert c.is_required("symbol") is False  # 显式声明优先
+    assert c.is_required("symbol") is False  # an explicit declaration takes precedence
     assert c.is_required("trade_date") is False
 
 

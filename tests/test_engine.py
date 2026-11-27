@@ -1,4 +1,4 @@
-"""引擎端到端测试：分叉、错误处理、parquet 读取、指纹。"""
+"""Engine end-to-end tests: forks, error handling, parquet input and fingerprints."""
 
 import pandas as pd
 import pytest
@@ -78,11 +78,11 @@ def test_end_to_end_with_mapping_and_dedupe():
 
 
 def test_row_fork_and_column_fork():
-    """一份输入按行分叉成两组，每组产出两个不同列集的输出。"""
+    """One input is row-forked into two groups, each producing two different column sets."""
     df = pd.DataFrame(
         {
             "code": ["600000", "000001", "510300"],
-            "name": ["浦发", "平安", "ETF"],
+            "name": ["Pudong", "Ping An", "ETF"],
             "close": ["10", "20", "3"],
         }
     )
@@ -120,7 +120,7 @@ def test_row_fork_and_column_fork():
 
 def test_zero_row_output_fails():
     c = make_contract()
-    # 行分叉发生在字段映射之前，需使用原始列名
+    # Row forks run before field mapping, so the raw column name is used here.
     rules = Rules(
         mapping={"raw_symbol": "symbol"},
         filters={"none": RowForkSpec(key="none", field="raw_symbol", regex="^ZZZ", outputs=("t",))},
@@ -128,7 +128,7 @@ def test_zero_row_output_fails():
     result = make_engine().clean(CleanRequest(input=sample_df(), contracts={"t": c}, rules=rules))
     assert result.status == "success"
     assert result.outputs[0].status == "failed"
-    assert any("0 行" in e for e in result.outputs[0].report.errors)
+    assert any("0 rows" in e for e in result.outputs[0].report.errors)
 
 
 def test_required_missing_column_fails():
@@ -138,7 +138,7 @@ def test_required_missing_column_fails():
         CleanRequest(input=df, contracts={"t": c}, rules=Rules())
     )
     assert result.outputs[0].status == "failed"
-    assert any("required" in e or "缺失" in e for e in result.outputs[0].report.errors)
+    assert any("required" in e or "missing" in e.lower() for e in result.outputs[0].report.errors)
 
 
 def test_empty_input_returns_failed_result():
@@ -148,7 +148,7 @@ def test_empty_input_returns_failed_result():
     )
     assert result.status == "failed"
     assert result.outputs == ()
-    assert any("0 行" in e for e in result.errors)
+    assert any("0 rows" in e for e in result.errors)
 
 
 def test_parquet_input(tmp_path):

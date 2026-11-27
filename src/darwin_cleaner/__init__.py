@@ -1,11 +1,12 @@
 # src/darwin_cleaner/__init__.py
 
 """
-darwin-cleaner：契约与规则驱动的单文件清洗引擎。
+darwin-cleaner: a contract- and rule-driven single-file cleaning engine.
 
-边界：读取单个 parquet -> 行分叉/列分叉 -> 按 order 跑 middleware ->
-返回数据与 meta。无 source / clean_type 等业务概念；
-不含配置加载、文件发现、调度、断点、CLI 与落盘。
+Scope: read a single parquet -> row forks / column forks -> run middleware by
+order -> return data and meta. No business concepts such as source / clean_type;
+no configuration loading, file discovery, scheduling, checkpoints, CLI, or
+persistence to disk.
 """
 
 from __future__ import annotations
@@ -59,7 +60,7 @@ from darwin_cleaner.rules import (
     TransformSpec,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 __all__ = [
     "__version__",

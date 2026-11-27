@@ -1,29 +1,31 @@
 # darwin-cleaner
 
-契约与规则驱动的**单文件清洗引擎**：读取一个 parquet（或内存 DataFrame）→ 行分叉 / 列分叉 → 按 order 跑 middleware → 在内存中返回数据与 meta。
+[English](README.md) · [简体中文](README.cn.md)
 
-## 边界
+A contract- and rules-driven **single-file cleaning engine**: read one parquet file (or an in-memory DataFrame) → split rows / columns → run middlewares by `order` → return data and meta in memory.
 
-本库只做数据变换，不做上下游事务：
-
-| 库内 | 库外（上层应用） |
-|---|---|
-| 读单个 parquet / 接收 DataFrame | 多文件合并、文件发现、新鲜度判定 |
-| 行分叉 / 列分叉 | 加载 `cleaner.json` / `clean.d/*.json` / adapter 配置 |
-| 12 个内置 middleware（含默认关闭的 `dedupe`） | 写 parquet / csv / meta / 断点 |
-| 契约与规则校验、统计与报告生成 | CLI、调度、退出码、业务标识 |
-
-详细设计见 [docs/design.md](docs/design.md)，现有代码梳理见 [docs/clean阶段代码逻辑梳理.md](docs/clean阶段代码逻辑梳理.md)。
-
-## 安装
+Python >= 3.10.
 
 ```bash
-pip install -e ".[test]"
+pip install darwin-cleaner
 ```
 
-依赖：`pandas>=2.0`、`pyarrow>=12`；Python >= 3.10。
+## Scope
 
-## 快速开始
+This library only transforms data. Upstream and downstream concerns stay outside:
+
+| In the library | Outside (caller's responsibility) |
+|---|---|
+| Read a single parquet / accept a DataFrame | Merge multiple files, discover files, check freshness |
+| Row forks / column forks | Load `cleaner.json` / `clean.d/*.json` / adapter configs |
+| 12 built-in middlewares (`dedupe` disabled by default) | Write parquet / csv / meta / checkpoints |
+| Contract and rules validation, stats and report generation | CLI, scheduling, exit codes, business identifiers |
+
+See [docs/design.md](docs/design.md) for the design and [docs/clean-stage-code-walkthrough.md](docs/clean-stage-code-walkthrough.md) for a walkthrough of the original clean-stage code. Run the [examples](examples/README.md) to see the engine in action.
+
+---
+
+## 1. Quick start
 
 ```python
 from pathlib import Path
@@ -33,7 +35,7 @@ from darwin_cleaner import (
 )
 
 registry = MiddlewareRegistryImpl()
-registry.builtins()  # 12 个内置步骤，dedupe 默认关闭
+registry.builtins()  # 12 built-in steps; dedupe is off by default
 
 contract = Contract(
     name="stk_ohlcv",
@@ -44,7 +46,7 @@ contract = Contract(
     },
     types={"float": TypeSpec(name="float", converter="numeric", min=0)},
     output=("symbol", "trade_date", "close"),
-    keys=("symbol", "trade_date"),  # 参与 keys 的列自动 required
+    keys=("symbol", "trade_date"),  # columns in keys are implicitly required
 )
 
 engine = CleaningEngine(registry)
@@ -65,42 +67,54 @@ result = engine.clean(CleanRequest(
 for out in result.outputs:
     if out.status == "success":
         df = out.data        # pandas.DataFrame
-        meta = out.meta      # 内容 hash + 规则指纹 + 统计
-        report = out.report  # 过程审计
-        # 写盘由上层负责
+        meta = out.meta      # content hash + rule fingerprint + stats
+        report = out.report  # audit trail
+        # Persistence is the caller's responsibility.
 ```
 
-## 核心概念
+---
 
-- **Contract**：字段、类型、输出列、唯一行键、排序。由上层解析配置后注入，引擎不读配置文件。
-- **FieldSpec.required**：三态。`True` 缺失即报错；`False` 显式允许缺失（补空列）；`None` 未声明时由引擎推导——参与 `sort` / `keys` 的列自动为 `True`，其余为 `False`。
-- **Rules**：`mapping` / `value_map` / `transform` / `filters` / `outputs` 等，替代 middleware 内的全局配置读取。
-- **Middleware**：统一签名 `(df, ctx, params) -> df | None`。`order` 决定执行顺序，`params` 是声明式参数（计入规则指纹），`enabled` 是开关；`MiddlewareOverride` 可按请求覆盖。
-- **order 分段**：`10-19` 预处理、`20-29` dtype、`30-39` 填充、`40-49` 公式、`50-69` 校验/去重、`90-99` 输出。
+## 2. Core concepts
 
-## 内置 middleware
+- **Contract** — fields, types, output columns, unique-row keys and sort order. The caller parses config files and injects contracts; the engine never reads configuration.
+- **FieldSpec.required** — tri-state. `True`: a missing column is an error. `False`: explicitly optional (filled with nulls). `None`: not declared; the engine infers it — columns used in `sort` or `keys` become `True`, all others `False`.
+- **Rules** — `mapping` / `value_map` / `transform` / `filters` / `outputs`, etc. They replace global config lookups inside middlewares.
+- **Middleware** — unified signature `(df, ctx, params) -> df | None`. `order` decides execution position, `params` are declarative (and part of the rule fingerprint), `enabled` is the on/off switch, and `MiddlewareOverride` can change both per request.
+- **Order bands** — `10-19` preprocessing, `20-29` dtype, `30-39` fill, `40-49` formulas, `50-69` validation / dedupe, `90-99` output.
 
-| order | 名称 | 作用 | 默认 |
+---
+
+## 3. Built-in middlewares
+
+| Order | Name | Purpose | Default |
 |---|---|---|---|
-| 10 | `field_mapping` | 字段改名 | 开 |
-| 12 | `value_mapping` | 值替换 | 开 |
-| 15 | `field_transform` | 常量 / 系数 / 动作 | 开 |
-| 20 | `type_conversion` | dtype 归一 | 开 |
-| 30 | `fill` | 分组 ffill | 开 |
-| 40 | `formula_compute` | 全空列按公式计算 | 开 |
-| 45 | `formula_validate` | 双容差公式校验 | 开 |
-| 50 | `consistency` | 字段间一致性 | 开 |
-| 60 | `type_validate` | inf / min / max 越界置空 | 开 |
-| 70 | `dedupe` | 按 keys 去重 | **关** |
-| 90 | `output` | 按契约选列 | 开 |
-| 95 | `sort` | 按契约排序 | 开 |
+| 10 | `field_mapping` | Rename fields | on |
+| 12 | `value_mapping` | Replace values | on |
+| 15 | `field_transform` | Constants / scale / actions | on |
+| 20 | `type_conversion` | Normalize dtypes | on |
+| 30 | `fill` | Group-wise forward fill | on |
+| 40 | `formula_compute` | Compute all-null columns from formulas | on |
+| 45 | `formula_validate` | Validate formulas with dual tolerance | on |
+| 50 | `consistency` | Cross-field consistency | on |
+| 60 | `type_validate` | Null out inf / out-of-range values | on |
+| 70 | `dedupe` | Deduplicate by keys | **off** |
+| 90 | `output` | Select columns per contract | on |
+| 95 | `sort` | Sort per contract | on |
 
-## 测试
+`builtins()` registers all 12. Disabled middlewares are skipped at the registry level: they do not enter the plan and are never called. User middlewares can be loaded from a directory with `load_middlewares_from_dir(path)` and registered explicitly. Duplicate names raise `CleanerRuleError` at registration time.
+
+---
+
+## 4. Testing
 
 ```bash
-pytest
+PYTHONPATH=src pytest
 ```
 
-## 许可证
+The suite covers contracts, fork plans, the registry (built-ins, switches, overrides, conflicts, fingerprints, directory loading), all 12 built-in steps, end-to-end engine paths (row + column forks, parquet input, zero-row failure, missing required columns) and strict / lenient error modes.
+
+---
+
+## 5. License
 
 MIT

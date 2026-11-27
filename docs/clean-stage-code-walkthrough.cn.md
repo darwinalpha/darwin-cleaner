@@ -1,5 +1,7 @@
 # darwin-fetch clean 阶段代码逻辑梳理
 
+English · [简体中文](clean-stage-code-walkthrough.cn.md)
+
 > 本文是对 `darwin-fetch/` 中 clean 阶段全部代码的只读梳理，目的是为 `darwin-cleaner` 新库的边界设计与剥离迁移提供完整的逻辑底稿。
 > 范围：入口脚本、Shell 批量调度、核心执行引擎、契约加载、middleware 规则链、全部配置、上下游耦合点。
 > 文中所有行号/函数名/配置键均来自源码原文；"注"开头的内容为梳理判断，非代码事实。

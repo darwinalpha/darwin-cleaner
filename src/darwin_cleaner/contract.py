@@ -1,12 +1,14 @@
 # src/darwin_cleaner/contract.py
 
 """
-契约值对象：描述"一份数据应该长什么样"。
+Contract value objects: describe "what a piece of data should look like".
 
-这些类型由上层解析后注入引擎，引擎不负责读取文件。
-所有对象均为 frozen，执行期间不可变。
+These types are parsed by the upper layer and injected into the engine;
+the engine is not responsible for reading files.
+All objects are frozen and immutable during execution.
 
-注意：Contract.name 只是诊断用的标签，不是 clean_type / source 等业务概念。
+Note: Contract.name is only a label for diagnostics, not a business concept
+such as clean_type / source.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ SortDirection = Literal["ascending", "descending"]
 
 @dataclass(frozen=True)
 class FillSpec:
-    """字段填充规则。"""
+    """Field fill rule."""
 
     strategy: Literal["ffill", "value", "none"] = "ffill"
     max_days: int = 5
@@ -29,7 +31,7 @@ class FillSpec:
 
 @dataclass(frozen=True)
 class TypeSpec:
-    """类型定义。"""
+    """Type definition."""
 
     name: str
     converter: str | None = None
@@ -43,10 +45,11 @@ class TypeSpec:
 @dataclass(frozen=True)
 class FieldSpec:
     """
-    单个字段的契约。
+    Contract for a single field.
 
-    type_def 保留原始定义字典，便于上层做兼容与诊断；
-    常用约束同时提升为显式字段，供规则直接读取。
+    type_def keeps the original definition dict for upper-layer compatibility
+    and diagnostics; commonly used constraints are also promoted to explicit
+    fields so that rules can read them directly.
     """
 
     name: str
@@ -59,19 +62,20 @@ class FieldSpec:
     on_violation: ViolationAction = "null"
     required: bool | None = None
     """
-    该列是否必须存在于输出数据中（三态）。
+    Whether this column must be present in the output data (tri-state).
 
-    True  —— 缺失即报错；
-    False —— 显式允许缺失，补空列；
-    None  —— 未声明，由 Contract 推导：sort / keys 字段为 True，其余为 False。
+    True  -- missing is an error;
+    False -- missing is explicitly allowed, and an empty column is added;
+    None  -- not declared; derived by Contract: True for sort / keys fields,
+             False for all others.
 
-    最终取值请用 Contract.is_required(field) 获取。
+    Use Contract.is_required(field) for the final value.
     """
 
 
 @dataclass(frozen=True)
 class SortSpec:
-    """单字段排序声明；多个 SortSpec 的顺序即排序优先级。"""
+    """Single-field sort declaration; the order of multiple SortSpecs is the sort priority."""
 
     field: str
     direction: SortDirection = "ascending"
@@ -80,9 +84,10 @@ class SortSpec:
 @dataclass(frozen=True)
 class Contract:
     """
-    通用契约视图：字段、类型、输出列、排序。
+    Generic contract view: fields, types, output columns, sorting.
 
-    fields / types 由上层完成合并后注入，本库只接收合并后的不可变视图。
+    fields / types are merged by the upper layer and then injected; this
+    library only accepts the merged immutable view.
     """
 
     name: str = ""
@@ -91,24 +96,27 @@ class Contract:
     output: tuple[str, ...] = ()
     keys: tuple[str, ...] = ()
     """
-    区分唯一行的列（复合键）。空元组表示不区分唯一行，允许重复行。
+    Columns that distinguish unique rows (composite key). An empty tuple means
+    unique rows are not distinguished and duplicate rows are allowed.
 
-    非空时这些列必须出现在 output 中；其 required 由 is_required() 推导为 True。
-    是否/如何去重由 dedupe middleware 的 params 控制（默认关闭）。
+    When non-empty, these columns must appear in output; their required status
+    is derived as True by is_required(). Whether/how to deduplicate is controlled
+    by the params of the dedupe middleware (disabled by default).
     """
     sort: tuple[SortSpec, ...] = ()
     enabled: bool = True
     help: str = ""
 
     def output_specs(self) -> tuple[FieldSpec, ...]:
-        """按 output 顺序返回字段定义。"""
+        """Return field definitions in output order."""
         return tuple(self.fields[name] for name in self.output if name in self.fields)
 
     def is_required(self, field: str) -> bool:
         """
-        字段的最终必填性。
+        Final required status of a field.
 
-        显式声明优先；未声明时，参与 sort 或 keys 的字段推导为 True，其余为 False。
+        An explicit declaration takes precedence; otherwise fields participating
+        in sort or keys are derived as True, and all others as False.
         """
         spec = self.fields.get(field)
         if spec is not None and spec.required is not None:
@@ -121,9 +129,10 @@ class Contract:
 
     def dedupe_keys(self) -> tuple[str, ...]:
         """
-        返回契约声明的去重键。
+        Return the deduplication keys declared by the contract.
 
-        仅供上层与 dedupe middleware 参考；dedupe 的 params.keys 优先级更高。
+        For reference by the upper layer and the dedupe middleware only;
+        dedupe's params.keys takes precedence.
         """
         return self.keys
 

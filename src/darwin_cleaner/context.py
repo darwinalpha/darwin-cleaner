@@ -1,10 +1,10 @@
 # src/darwin_cleaner/context.py
 
 """
-执行上下文：middleware 从 ctx 读取契约、规则与报告。
+Execution context: middleware reads the contract, rules, and report from ctx.
 
-不含任何业务标识（source / clean_type / date / filename），
-不含 IO 选项（output_path / overwrite / check_only / csv_mode）。
+Contains no business identifiers (source / clean_type / date / filename),
+and no IO options (output_path / overwrite / check_only / csv_mode).
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 
 class Logger(Protocol):
-    """最小日志协议，避免绑定具体日志库。"""
+    """Minimal logging protocol to avoid binding to a specific logging library."""
 
     def debug(self, msg: str, *args: Any) -> None: ...
 
@@ -35,9 +35,10 @@ class Logger(Protocol):
 @dataclass
 class CleanContext:
     """
-    单个分叉的运行时上下文。
+    Runtime context for a single fork.
 
-    output_key 只是本次产出的标识，供报告使用，不携带业务语义。
+    output_key is only an identifier for this output, used by the report;
+    it carries no business semantics.
     """
 
     output_key: str

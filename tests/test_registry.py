@@ -1,4 +1,4 @@
-"""注册表测试：order 排序、开关、请求覆盖、同名冲突、指纹。"""
+"""Middleware registry: order sorting, switches, overrides, duplicate names and fingerprints."""
 
 import pytest
 

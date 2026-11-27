@@ -1,4 +1,4 @@
-"""错误处理测试：strict 快速失败、宽松降级、配置错误传播。"""
+"""Error handling: strict fail-fast, lenient degradation and config error propagation."""
 
 import pandas as pd
 

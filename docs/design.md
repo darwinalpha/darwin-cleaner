@@ -1,77 +1,79 @@
-# darwin-cleaner 设计文档（草案 v0.4）
+# darwin-cleaner Design Document (v0.4)
 
-> 状态：设计草案，仅定义边界、架构与接口，不含实现。
-> v0.2：输入收窄为**单个 parquet**；专属 middleware 不迁入；剥离 `source` / `clean_type` 等业务概念；确认 **order 机制**；新增 `builtins()` 与 `load_middlewares_from_dir(path)`；补充行分叉说明。
-> v0.3：0 行输出按错误处理；写盘格式全归上层 writer；同名 middleware 注册期失败；`FieldSpec.required` 逐列控制缺列行为并取消 `missing_output_policy`；`Contract.keys` 声明唯一行键。
-> v0.4：middleware 增加声明式 `params` 与强类型 Options 约定；`enabled` 开关（注册期 + 请求级 overrides），注册表层跳过；`required` 改三态，sort/keys 自动推导；非 required 缺列补空且不告警（由 output 参数开关）；去重内置为第 12 个 middleware，默认关闭。
+[English](design.md) · [简体中文](design.cn.md)
+
+> Status: design draft. It defines only boundaries, architecture and interfaces, no implementation.
+> v0.2: input narrowed to a **single parquet**; source-specific middleware are not migrated; business concepts such as `source` / `clean_type` are stripped out; the **order mechanism** is confirmed; `builtins()` and `load_middlewares_from_dir(path)` are added; a row-forking explanation is added.
+> v0.3: zero-row output is handled as an error; all on-disk formats become the upper-layer writer's responsibility; duplicate middleware names fail at registration time; `FieldSpec.required` controls missing-column behavior per column and `missing_output_policy` is removed; `Contract.keys` declares the unique row key.
+> v0.4: middleware gains declarative `params` and a strongly-typed Options convention; an `enabled` switch (registration time + request-level overrides), skipped at the registry layer; `required` becomes tri-state with sort/keys auto-derivation; non-required missing columns are filled empty with no warning (toggled by an output parameter); deduplication is built in as the 12th middleware, disabled by default.
 
 ---
 
-## 1. 定位
+## 1. Positioning
 
-darwin-cleaner 是一个**纯清洗引擎库**：读取**一个** parquet（或内存 DataFrame），按上层注入的契约与规则做行分叉、列分叉，按 **order 顺序**执行已启用的 middleware，在内存中返回每个分叉的数据和元数据。
+darwin-cleaner is a **pure cleaning engine library**: it reads **one** parquet (or an in-memory DataFrame), performs row forking and column forking according to contracts and rules injected by the upper layer, executes enabled middleware in **order** sequence, and returns the data and metadata of each fork in memory.
 
-一句话职责：**读取单文件 → 分叉 → 按 order 跑链 → 返回数据与 meta**。
+One-sentence responsibility: **read a single file → fork → run the chain in order → return data and meta**.
 
-### 1.1 设计目标
+### 1.1 Design goals
 
-| 目标 | 含义 |
+| Goal | Meaning |
 |---|---|
-| 正确 | 契约先校验后执行；错误不被静默降级；统计与报告字段都有真实写入方；输出确定、可复现 |
-| 快速 | 单文件只读一次；按列裁剪；分叉共享读取结果；执行计划缓存；避免逐行 `apply` |
-| 可插拔 | middleware 以 `order` 声明、以 `params` 配置、以 `enabled` 开关；实例级注册；用户目录可加载 |
-| 无业务概念 | 不认识 `source` / `clean_type` / `raw_type` / 日期 / 断点；只认识契约、规则、DataFrame |
-| 无 IO 副作用 | 不写文件、不读断点、不产生 CLI 退出码；只做数据变换与元信息生成 |
+| Correctness | contracts are validated before execution; errors are not silently downgraded; statistics and report fields all have real writers; output is deterministic and reproducible |
+| Speed | a single file is read once; prune by column; forks share the read result; execution plans are cached; avoid per-row `apply` |
+| Pluggability | middleware declares `order`, is configured via `params`, and toggled via `enabled`; instance-level registration; user directories can be loaded |
+| No business concepts | no knowledge of `source` / `clean_type` / `raw_type` / dates / breakpoints; only contracts, rules and DataFrames |
+| No IO side effects | no file writes, no breakpoint reads, no CLI exit codes; only data transformation and metadata generation |
 
-### 1.2 非目标（明确不做）
+### 1.2 Non-goals (explicitly out of scope)
 
-- 多 parquet 文件读入与合并（上层完成，库只接单文件）
-- 加载 `cleaner.json` / `clean.d/*.json` / 任何配置文件
-- 文件发现、路径过滤、新鲜度判定
-- 读取 fetch 断点、解析 done 路径、写 clean 断点
-- 写出 parquet / meta.json / 报告文件；**任何文件格式**（parquet / csv / ...）的序列化与写盘都是上层 writer 的责任，库只在内存中返回 DataFrame
-- CLI 参数定义、退出码映射、批量调度、wrapper 幂等
-- 任何数据源专属业务规则（`stk_limit` / `gold_sge` / `trd_calendar` / `stk_code` / `stk_hkcode` / `ftshare` / `ohlcvault` / `json_extract` 等）
-- 门面编排（`Cleaner` 类）与 selectors 扫描
+- reading and merging multiple parquet files (done by the upper layer; the library accepts a single file)
+- loading `cleaner.json` / `clean.d/*.json` / any configuration file
+- file discovery, path filtering, freshness determination
+- reading fetch breakpoints, resolving done paths, writing clean breakpoints
+- writing parquet / meta.json / report files; serialization and persistence of **any file format** (parquet / csv / ...) are the upper-layer writer's responsibility; the library only returns DataFrames in memory
+- CLI parameter definitions, exit code mapping, batch scheduling, wrapper idempotence
+- any data-source-specific business rule (`stk_limit` / `gold_sge` / `trd_calendar` / `stk_code` / `stk_hkcode` / `ftshare` / `ohlcvault` / `json_extract`, etc.)
+- facade orchestration (`Cleaner` class) and selectors scanning
 
 ---
 
-## 2. 边界映射（从现有代码迁移什么）
+## 2. Boundary mapping (what to migrate from the existing code)
 
-| 现有文件 / 逻辑 | 处理方式 | 说明 |
+| Existing file / logic | Treatment | Notes |
 |---|---|---|
-| `task.py`：分叉解析、行过滤、列分叉、跑链、统计收集、meta 生成 | **迁入并重构** | 去掉路径拼接、写文件、done 反查；保留分叉与链执行 |
-| `task.py`：`load_data()` | **迁入为单文件 Reader** | 只读一个 parquet；支持列裁剪；多文件合并留给上层 |
-| `task.py`：`save_data()` / `_write_meta()` / `_compute_hash()` | **拆分** | meta 内容生成迁入；文件写入与路径交给上层；hash 改为基于 DataFrame 内容 |
-| `middlewares/base.py`：注册、order 排序、查询 | **迁入并扩展** | 实例级注册表；去掉 `clean_type` / `source` 作用域；增加 `params` / `enabled` |
-| `middlewares/steps.py`：11 个全局步骤 | **迁入为内置 middleware** | `builtins()` 显式注册；从 `get_config` 改为读 `ctx.rules` / `ctx.contract` / `params` |
-| 去重逻辑 | **新增内置 middleware** | 现有代码无去重；新增 `dedupe(70)`，默认关闭 |
-| `middlewares/{stk_limit,gold_sge,trd_calendar,stk_code,stk_hkcode,ftshare,ohlcvault,json_extract,stk_ohlcv}.py` | **不迁入** | 业务/源侧专属规则；上层可改写成通用 middleware，用 `load_middlewares_from_dir()` 加载 |
-| `context.py` | **迁入并精简** | 去掉 output_path、CLI 选项、done、身份字段；保留 output_key / contract / rules / report |
-| `contract.py`：`FieldSpec` / 契约类型与合并校验 | **迁入类型，去除加载** | `load_contract` / `ensure_loaded` / `list_clean_types` 留给上层；`CleanContract` → `Contract` |
-| `report.py` / `result.py` / `exceptions.py` | **迁入并强化** | 去掉 exit_code、业务标识、路径语义；补齐统计写入方 |
-| `cleaner.py`（门面）、`actions/`、Shell 脚本 | **不迁入** | 上层应用职责 |
-| `clean.d/*.json`、`cleaner.json`、`adapters/*/adapter_clean.json` | **不迁入** | 上层读取后注入 |
+| `task.py`: fork resolution, row filtering, column forking, chain execution, statistics collection, meta generation | **Migrate and refactor** | remove path concatenation, file writing and done lookup; keep forking and chain execution |
+| `task.py`: `load_data()` | **Migrate as a single-file Reader** | read only one parquet; support column pruning; multi-file merging is left to the upper layer |
+| `task.py`: `save_data()` / `_write_meta()` / `_compute_hash()` | **Split** | meta generation migrates; file writing and paths go to the upper layer; hash is based on DataFrame content |
+| `middlewares/base.py`: registration, order sorting, lookup | **Migrate and extend** | instance-level registry; remove `clean_type` / `source` scoping; add `params` / `enabled` |
+| `middlewares/steps.py`: 11 global steps | **Migrate as built-in middleware** | explicit registration via `builtins()`; switch from `get_config` to reading `ctx.rules` / `ctx.contract` / `params` |
+| deduplication logic | **Add as a built-in middleware** | no dedupe in the existing code; add `dedupe(70)`, disabled by default |
+| `middlewares/{stk_limit,gold_sge,trd_calendar,stk_code,stk_hkcode,ftshare,ohlcvault,json_extract,stk_ohlcv}.py` | **Not migrated** | business/source-specific rules; the upper layer may rewrite them as generic middleware and load them via `load_middlewares_from_dir()` |
+| `context.py` | **Migrate and simplify** | remove output_path, CLI options, done and identity fields; keep output_key / contract / rules / report |
+| `contract.py`: `FieldSpec` / contract types and merge validation | **Migrate types, drop loading** | `load_contract` / `ensure_loaded` / `list_clean_types` stay in the upper layer; `CleanContract` → `Contract` |
+| `report.py` / `result.py` / `exceptions.py` | **Migrate and strengthen** | remove exit_code, business identifiers and path semantics; fill in the statistics writers |
+| `cleaner.py` (facade), `actions/`, Shell scripts | **Not migrated** | upper-layer application responsibilities |
+| `clean.d/*.json`, `cleaner.json`, `adapters/*/adapter_clean.json` | **Not migrated** | read by the upper layer and injected |
 
 ---
 
-## 3. 总体架构
+## 3. Overall architecture
 
 ```mermaid
 flowchart LR
-    subgraph Upper["上层（darwin-fetch / 其他应用）"]
-        A1["读配置并解析<br/>Contract + Rules + Overrides"]
-        A2["发现单个文件<br/>多文件合并也在这里"]
-        A3["业务 middleware 目录<br/>专属规则"]
-        A4["写 parquet / meta / done<br/>CLI / 调度"]
+    subgraph Upper["Upper layer (darwin-fetch / other apps)"]
+        A1["Read config and parse<br/>Contract + Rules + Overrides"]
+        A2["Discover a single file<br/>multi-file merging also here"]
+        A3["Business middleware directory<br/>specific rules"]
+        A4["Write parquet / meta / done<br/>CLI / scheduling"]
     end
 
-    subgraph Lib["darwin-cleaner（本库）"]
+    subgraph Lib["darwin-cleaner (this library)"]
         B1["CleanRequest"]
-        B2["Reader<br/>单文件 + 列裁剪"]
-        B3["Forker<br/>行分叉 / 列分叉"]
-        B4["MiddlewareRegistry<br/>order / params / enabled / 目录加载"]
-        B5["Runner<br/>resolve → 按 order 执行 + 校验"]
+        B2["Reader<br/>single file + column pruning"]
+        B3["Forker<br/>row fork / column fork"]
+        B4["MiddlewareRegistry<br/>order / params / enabled / dir loading"]
+        B5["Runner<br/>resolve → execute in order + validate"]
         B6["ResultBuilder<br/>DataFrame + meta + report"]
     end
 
@@ -79,167 +81,167 @@ flowchart LR
     A2 --> B1
     A3 --> B4
     B1 --> B2 --> B3 --> B4 --> B5 --> B6
-    B6 -->|"CleanResult（内存）"| A4
+    B6 -->|"CleanResult (in memory)"| A4
 ```
 
-### 3.1 分层职责
+### 3.1 Layered responsibilities
 
-1. **值对象层**：`Contract` / `FieldSpec` / `Rules` / `CleanRequest` / `CleanMeta` / `CleanReport` / 异常 —— 无 IO、无全局状态、无业务标识。
-2. **注册层**：`MiddlewareRegistry` —— 实例级注册表，按 `order` 排序，`params` 配置行为，`enabled` 控制启停；`builtins()` 注册 12 个内置步骤；`load_middlewares_from_dir()` 加载用户 middleware。
-3. **执行层**：`CleaningEngine` —— 读取单文件、分叉、按 order 执行、汇总结果；无文件系统写入副作用。
+1. **Value-object layer**: `Contract` / `FieldSpec` / `Rules` / `CleanRequest` / `CleanMeta` / `CleanReport` / exceptions — no IO, no global state and no business identifiers.
+2. **Registry layer**: `MiddlewareRegistry` — instance-level registry, sorted by `order`, behavior configured by `params`, toggled by `enabled`; `builtins()` registers 12 built-in steps; `load_middlewares_from_dir()` loads user middleware.
+3. **Execution layer**: `CleaningEngine` — reads a single file, forks, executes in order and aggregates the results; no filesystem write side effects.
 
 ---
 
-## 4. 核心数据流
+## 4. Core data flow
 
 ```mermaid
 sequenceDiagram
-    participant U as 上层应用
+    participant U as Upper-layer app
     participant E as CleaningEngine
     participant R as Reader
     participant F as Forker
     participant M as MiddlewareRegistry
 
     U->>E: clean(CleanRequest)
-    E->>E: preflight：校验契约、规则、覆盖项、注册链
-    E->>M: resolve(overrides) → 已启用 middleware 按 order 排序
-    E->>R: 读取单个输入文件（可列裁剪）
-    R-->>E: DataFrame（只读一次）
-    E->>F: 由 Rules.filters / outputs 派生分叉计划
-    loop 每个行分叉组
-        F->>F: field + regex / exclude_regex 过滤
-        loop 该组每个输出名（列分叉）
-            F->>F: sub.copy() 隔离
-            loop 每个已启用 middleware
-                E->>E: fn(df, ctx, params) 执行并记录统计/违规
+    E->>E: preflight: validate contract, rules, overrides, registration chain
+    E->>M: resolve(overrides) → enabled middleware sorted by order
+    E->>R: read a single input file (column pruning optional)
+    R-->>E: DataFrame (read only once)
+    E->>F: derive fork plan from Rules.filters / outputs
+    loop for each row-fork group
+        F->>F: field + regex / exclude_regex filtering
+        loop for each output name in the group (column fork)
+            F->>F: sub.copy() isolation
+            loop for each enabled middleware
+                E->>E: fn(df, ctx, params) executes and records stats / violations
             end
-            E->>E: 生成 meta（内容 hash + 规则指纹）
+            E->>E: generate meta (content hash + rule signature)
         end
     end
     E-->>U: CleanResult[(data, meta, report)...]
-    U->>U: 自行写 parquet / meta / done
+    U->>U: write parquet / meta / done itself
 ```
 
-### 4.1 为什么需要行分叉
+### 4.1 Why row forking is needed
 
-根因是**上游接口的返回粒度 ≠ 下游数据产品的粒度**：一个原始文件里混了多种语义的数据，必须按行拆开，否则会把 A 类数据写进 B 类的表。现有配置中的真实例子：
+The root cause is that **the granularity returned by the upstream interface ≠ the granularity of downstream data products**: a raw file mixes data of several semantics and must be split by row, otherwise type-A data would be written into a type-B table. Real examples from the existing configuration:
 
-| 上游 | 现象 | 行分叉做法 |
+| Upstream | Symptom | Row-fork approach |
 |---|---|---|
-| baostock `stock_code` | 一个文件同时返回股票、ETF、指数代码 | 按 `code` 正则切成三组：`sh.60/sz.00…` → `stk_code`，`sh.51/sz.15…` → `etf_code`，`sh.000/sz.399…` → `stk_index_code` |
-| tushare `fund_code` | ETF 与"联接基金"混在一起 | 按 `name` 正则排除含"联接"的行，只保留 ETF → `etf_code` |
+| baostock `stock_code` | one file returns stock, ETF and index codes at once | split into three groups by `code` regex: `sh.60/sz.00…` → `stk_code`, `sh.51/sz.15…` → `etf_code`, `sh.000/sz.399…` → `stk_index_code` |
+| tushare `fund_code` | ETFs and "feeder funds" are mixed together | exclude rows containing "联接" by `name` regex, keep only ETFs → `etf_code` |
 
-**列分叉是正交维度**：baostock `stock_daily` 一份 raw 同时带行情、估值、换手、ST 字段，行相同但分别投影成 `stk_ohlcv` / `stk_valuation` / `stk_turnover` / `stk_st`。
+**Column forking is an orthogonal dimension**: one baostock `stock_daily` raw file carries quotes, valuation, turnover and ST fields at once; the rows are the same but are projected separately into `stk_ohlcv` / `stk_valuation` / `stk_turnover` / `stk_st`.
 
-模型：
+Model:
 
 ```
-一个 raw 文件
- ├─ 行分叉（field + regex）：语义不同的行各归各
- │    └─ 列分叉（output_names）：组内行相同、列不同
- └─ 每个组合独立跑链、独立产出
+one raw file
+ ├─ row fork (field + regex): rows of different semantics go to their own groups
+ │    └─ column fork (output_names): same rows within a group, different columns
+ └─ each combination runs the chain and produces output independently
 ```
 
-新库保留分叉能力，但输出用中性的 `output_key` / `output_names`，不绑定 `clean_type`。
+The new library keeps the forking capability, but uses neutral `output_key` / `output_names` for outputs, not bound to `clean_type`.
 
-### 4.2 分叉语义
+### 4.2 Fork semantics
 
-- **行分叉**：`Rules.filters` 为 `{key: RowForkSpec}`；`field` 列不存在时不过滤（全量通过）；`regex` 与 `exclude_regex` 可同时存在（两者都满足才命中）。
-- **列分叉**：每个输出有自己的 `Contract.output`，决定列集与列顺序。
-- **行重叠**：同一行可进入多个组；每组 `sub.copy()` 隔离，避免列筛选互相污染。
-- **无 filters 时**：退化为单组 `"all"`，使用 `Rules.outputs`。
-- 分叉计划也可由调用方直接以 `fork_plans` 注入，绕过规则解析。
+- **Row fork**: `Rules.filters` is `{key: RowForkSpec}`; if the `field` column does not exist, no filtering is applied (all rows pass); `regex` and `exclude_regex` may both be present (a row is a hit only when both are satisfied).
+- **Column fork**: each output has its own `Contract.output`, which determines the column set and column order.
+- **Row overlap**: the same row may enter multiple groups; each group uses `sub.copy()` for isolation to avoid column filtering cross-contaminating other groups.
+- **No filters**: degenerates into a single group `"all"` using `Rules.outputs`.
+- The fork plan may also be injected directly by the caller via `fork_plans`, bypassing rule resolution.
 
-### 4.3 链执行（order 机制）
+### 4.3 Chain execution (the order mechanism)
 
-- `resolve(overrides)` 返回**已启用**的 middleware，按 `(order, 注册序号)` 稳定排序；`enabled=False` 的 spec 在注册表层被跳过，不进入执行计划、不被调用。
-- 无 `clean_type` / `source` 作用域过滤。
-- 每条 middleware 统一签名 `(df, ctx, params) -> df | None`；返回 `None` 表示不改动。`params` 来自注册值，可被请求级 overrides 覆盖。
-- order 分段沿用现有约定：`10-19` 预处理、`20-29` dtype、`30-39` 填充、`40-49` 公式、`50-69` 校验/去重、`90-99` 输出。用户 middleware 可用任意 order（如 `100+` 做后处理）。
-- **错误策略**：配置错误、校验失败与**零行输出**统一按错误路径处理（抛出 `CleanerDataEmptyError` 等）；其他异常在 `strict=True`（默认）下终止该分叉，`strict=False` 下记录 warning 并标记 `degraded=True`，防止静默脏数据。
+- `resolve(overrides)` returns **enabled** middleware, stably sorted by `(order, registration index)`; specs with `enabled=False` are skipped **at the registry layer** — they do not enter the execution plan and are not called.
+- No `clean_type` / `source` scope filtering.
+- Every middleware has the uniform signature `(df, ctx, params) -> df | None`; returning `None` means no change. `params` come from the registered value and may be overridden at request level.
+- order segments follow the existing convention: `10-19` preprocessing, `20-29` dtype, `30-39` filling, `40-49` formulas, `50-69` validation/dedupe, `90-99` output. User middleware may use any order (e.g. `100+` for post-processing).
+- **Error policy**: configuration errors, validation failures and **zero-row output** all follow the error path (throw `CleanerDataEmptyError`, etc.); other exceptions terminate that fork under `strict=True` (the default), while under `strict=False` a warning is recorded and `degraded=True` is marked, preventing silently dirty data.
 
 ---
 
-## 5. 关键概念
+## 5. Key concepts
 
-### 5.1 Contract（契约）
+### 5.1 Contract
 
-上层从 `clean.d/*.json` 解析并合并后注入的通用契约，包含字段、类型、输出列、唯一行键、排序。`Contract.name` 仅是诊断标签，不是 `clean_type`。
+A generic contract parsed and merged by the upper layer from `clean.d/*.json` and then injected, containing fields, types, output columns, unique row keys and sorting. `Contract.name` is only a diagnostic label, not a `clean_type`.
 
-**字段必填性（`FieldSpec.required` 三态）**：
-- `True`：该列缺失即报错；
-- `False`：显式允许缺失，补空列；
-- `None`（默认，未声明）：由 `Contract.is_required(field)` 推导——参与 `sort` 或 `keys` 的字段为 `True`，其余为 `False`。
+**Field requiredness (`FieldSpec.required` tri-state)**:
+- `True`: error if the column is missing;
+- `False`: missing explicitly allowed, fill with an empty column;
+- `None` (default, undeclared): derived by `Contract.is_required(field)` — fields participating in `sort` or `keys` are `True`, all others are `False`.
 
-这样 sort 列天然 required，无需上层逐份改契约；同时保留显式 `False` 的能力。preflight 只校验"推导出的 required 列是否在 fields 中有定义"，不要求显式写 `True`。
+This makes sort columns naturally required without requiring the upper layer to edit every contract, while preserving the ability to declare an explicit `False`. preflight only checks "whether derived required columns are defined in fields"; it does not require an explicit `True`.
 
-**唯一行键（`Contract.keys`）**：
-- 复合列元组；空元组表示不区分唯一行，允许重复行（这也是当前 darwin-fetch 的实际行为——`duplicates_removed` 始终为 0，无任何去重代码）；
-- 非空时这些列自动推导为 `required=True`，且必须在 `output` 中；
-- 是否/如何去重由 `dedupe` middleware 的 params 控制（默认关闭，见 6.2）。
+**Unique row key (`Contract.keys`)**:
+- a tuple of compound columns; an empty tuple means no unique-row distinction and duplicate rows are allowed (this is also the current actual behavior of darwin-fetch — `duplicates_removed` is always 0 and there is no deduplication code anywhere);
+- when non-empty, these columns are automatically derived as `required=True` and must be present in `output`;
+- whether and how to deduplicate is controlled by the `dedupe` middleware params (disabled by default, see 6.2).
 
-**Preflight 校验**：
-1. `output` 非空且每列都在 `fields` 中；
-2. 每个 `FieldSpec.type` 都在 `types` 中定义；
-3. 公式依赖字段可静态分析，提前检查缺失；
-4. 由 `is_required()` 推导为 required 的字段必须有定义；
-5. `sort` / `keys` 字段允许不在 `output` 中，但记 warning。
+**Preflight validation**:
+1. `output` is non-empty and every column is in `fields`;
+2. every `FieldSpec.type` is defined in `types`;
+3. formula dependency fields can be statically analyzed and checked for absence in advance;
+4. fields derived as required by `is_required()` must be defined;
+5. `sort` / `keys` fields are allowed to be absent from `output`, but a warning is recorded.
 
-### 5.2 Rules（规则）
+### 5.2 Rules
 
-上层解析后注入的通用规则，替代 middleware 内的全局配置读取：
+Generic rules parsed and injected by the upper layer, replacing global configuration reads inside middleware:
 
-| 规则节 | 用途 | 对应内置 middleware |
+| Rule section | Purpose | Corresponding built-in middleware |
 |---|---|---|
-| `mapping` | 源字段 → 契约字段 | `field_mapping` |
-| `value_map` | 字段值替换 | `value_mapping` |
-| `transform` | 常量 / 系数 / 动作 | `field_transform` |
-| `json_extract` | 从 dict 列提取 | 用户 middleware（不内置） |
-| `filters` | 行分叉组 | Forker |
-| `outputs` | 默认列分叉 | Forker |
+| `mapping` | source field → contract field | `field_mapping` |
+| `value_map` | field value replacement | `value_mapping` |
+| `transform` | constants / factors / actions | `field_transform` |
+| `json_extract` | extract from dict columns | user middleware (not built in) |
+| `filters` | row-fork groups | Forker |
+| `outputs` | default column fork | Forker |
 
 ### 5.3 CleanRequest
 
-唯一入口参数：
-- `input`：**单个** parquet 路径或内存 DataFrame；
-- `contracts`：`输出名 -> Contract`（只需本次产出的几个）；
-- `rules`：通用规则；
-- `options`：`strict` / `hash_algorithm` / 列裁剪 / `middleware_overrides`（请求级 middleware 覆盖）；
-- `fork_plans`：可选显式分叉计划。
+The sole entry-point parameter:
+- `input`: a **single** parquet path or an in-memory DataFrame;
+- `contracts`: `output name -> Contract` (only the ones needed for this run);
+- `rules`: generic rules;
+- `options`: `strict` / `hash_algorithm` / column pruning / `middleware_overrides` (request-level middleware overrides);
+- `fork_plans`: an optional explicit fork plan.
 
 ### 5.4 CleanContext
 
-单个分叉的运行时载体：`output_key` / `contract` / `rules` / `report` / `logger` / `data`。
-**不含** `source` / `clean_type` / `raw_type` / `date` / `filename` / `fetch_done_path` / `done_path` / `overwrite` / `check_only` / `csv_mode`。
+The runtime carrier of a single fork: `output_key` / `contract` / `rules` / `report` / `logger` / `data`.
+It **does not contain** `source` / `clean_type` / `raw_type` / `date` / `filename` / `fetch_done_path` / `done_path` / `overwrite` / `check_only` / `csv_mode`.
 
 ### 5.5 CleanOutput / CleanMeta / CleanReport
 
-- **CleanOutput** = `output_key` + `status` + `data` + `meta` + `report`，全在内存。`status ∈ {pending, success, failed, skipped}`，无 `empty`；0 行走错误路径。
-- **CleanMeta** = 行数、列集、基于内容的 `data_hash`、规则指纹 `rule_signature`、引擎版本、统计、警告。**不含**业务标识、路径、写入时间、断点反查。
-- **CleanReport** = 过程审计；`to_dict()` 可序列化，是否落盘由上层决定。
-- `rule_signature = hash(契约 + 规则 + 实际生效注册表内容含 params/enabled)`，供上层做幂等/变更判定，替代"文件是否存在"的二元语义。
+- **CleanOutput** = `output_key` + `status` + `data` + `meta` + `report`, all in memory. `status ∈ {pending, success, failed, skipped}`, there is no `empty`; zero rows follow the error path.
+- **CleanMeta** = row count, column set, content-based `data_hash`, rule fingerprint `rule_signature`, engine version, statistics and warnings. It **does not contain** business identifiers, paths, write time or breakpoint lookup.
+- **CleanReport** = process audit; `to_dict()` is serializable; whether to persist it is decided by the upper layer.
+- `rule_signature = hash(contract + rules + effective registry contents incl. params/enabled)`, used by the upper layer for idempotence / change detection, replacing the binary "does the file exist" semantics.
 
 ---
 
-## 6. Middleware 体系
+## 6. Middleware system
 
-### 6.1 声明式参数（`params`）
+### 6.1 Declarative parameters (`params`)
 
-- `MiddlewareSpec.params` 是 `Mapping[str, Any]`，引擎在调用时**原样**作为第三个参数传给 fn：`fn(df, ctx, params)`。
-- params 可序列化、可比较、计入 `rule_signature`——同一 middleware 不同参数视为不同规则链。
-- **强类型 Options 约定**：middleware 作者可在 fn 内部把 params 解析为自己的 `@dataclass` Options（带默认值与校验），既不牺牲声明式的可审查性，又获得类型安全。`MiddlewareSpec.enabled_with()` / `with_params()` 返回新 spec，便于上层派生变体。
-- 装饰器 `@middleware(order, version=..., params=..., enabled=...)` 把标记附到函数上，不执行注册。
+- `MiddlewareSpec.params` is `Mapping[str, Any]`; the engine passes it **as-is** as the third argument to fn: `fn(df, ctx, params)`.
+- params are serializable, comparable and counted in `rule_signature` — the same middleware with different params counts as a different rule chain.
+- **Strongly-typed Options convention**: a middleware author may parse params inside fn into their own `@dataclass` Options (with defaults and validation), keeping declarative auditability while gaining type safety. `MiddlewareSpec.enabled_with()` / `with_params()` return a new spec, making it easy for the upper layer to derive variants.
+- The decorator `@middleware(order, version=..., params=..., enabled=...)` attaches markers to the function; it does not perform registration.
 
-### 6.2 开关机制（`enabled` + overrides）
+### 6.2 Toggle mechanism (`enabled` + overrides)
 
-- `MiddlewareSpec.enabled` 是注册期开关；`resolve()` 在**注册表层**跳过 `enabled=False` 的 spec，不进入执行计划、不调用、不计入指纹。
-- 请求级覆盖：`CleanOptions.middleware_overrides: Mapping[name, MiddlewareOverride]`，按 name 覆盖 `enabled` / `params`；字段为 `None` 表示沿用注册值；未知 name 在 preflight 报错。
-- 典型用法：全局把 `dedupe` 注册为关闭，某个契约需要去重时按请求 `overrides={"dedupe": MiddlewareOverride(enabled=True, params={...})}` 开启；或临时打开 `output` 的 `warn_on_missing`。
-- 同名冲突：`register()` 遇到重复 `name` 立即抛 `CleanerRuleError`（启动期失败），不覆盖、不静默跳过；上层启动时捕获该异常，告警后退出。
+- `MiddlewareSpec.enabled` is a registration-time switch; `resolve()` skips specs with `enabled=False` **at the registry layer** — they do not enter the execution plan, are not called and do not count toward the fingerprint.
+- Request-level override: `CleanOptions.middleware_overrides: Mapping[name, MiddlewareOverride]`, overriding `enabled` / `params` by name; a field of `None` means inherit the registered value; an unknown name raises an error in preflight.
+- Typical usage: register `dedupe` globally as disabled, then enable it per request for a contract that needs deduplication with `overrides={"dedupe": MiddlewareOverride(enabled=True, params={...})}`; or temporarily turn on `warn_on_missing` for `output`.
+- Duplicate names: `register()` throws `CleanerRuleError` immediately on a duplicate `name` (a startup-time failure), with no overwrite and no silent skip; the upper layer catches this exception at startup, warns and exits.
 
 ```python
 registry = MiddlewareRegistryImpl()
-registry.builtins()                                  # 注册 12 个，dedupe 默认关
+registry.builtins()                                  # register 12, dedupe off by default
 for spec in load_middlewares_from_dir(Path("my_middlewares/")):
     registry.register(spec)
 
@@ -259,93 +261,93 @@ result = engine.clean(CleanRequest(
 ))
 ```
 
-### 6.3 内置 12 个通用步骤（`builtins()`）
+### 6.3 Twelve built-in generic steps (`builtins()`)
 
-| order | 名称 | 作用 | 默认 |
+| order | Name | Purpose | Default |
 |---|---|---|---|
-| 10 | `field_mapping` | 字段改名 | 开 |
-| 12 | `value_mapping` | 值替换 | 开 |
-| 15 | `field_transform` | 常量 / 系数 / 动作 | 开 |
-| 20 | `type_conversion` | dtype 归一（numeric/string/datetime/timestamp_ms） | 开 |
-| 30 | `fill` | 分组 ffill，统计写入 `nulls_filled` | 开 |
-| 40 | `formula_compute` | 全空列按公式计算；部分缺失只告警 | 开 |
-| 45 | `formula_validate` | 双容差校验（rel + abs 同时超才算不符） | 开 |
-| 50 | `consistency` | 字段间关系校验 | 开 |
-| 60 | `type_validate` | inf / min / max 越界置空 | 开 |
-| 70 | `dedupe` | 按 keys 去重 | **关** |
-| 90 | `output` | 按契约选列；非 required 缺列补空、默认不告警 | 开 |
-| 95 | `sort` | 按契约多字段排序 | 开 |
+| 10 | `field_mapping` | field renaming | on |
+| 12 | `value_mapping` | value replacement | on |
+| 15 | `field_transform` | constants / factors / actions | on |
+| 20 | `type_conversion` | dtype normalization (numeric/string/datetime/timestamp_ms) | on |
+| 30 | `fill` | grouped ffill, statistics written to `nulls_filled` | on |
+| 40 | `formula_compute` | compute all-empty columns by formula; partial absence only warns | on |
+| 45 | `formula_validate` | dual-tolerance validation (only a simultaneous rel + abs overflow counts as a mismatch) | on |
+| 50 | `consistency` | inter-field relationship validation | on |
+| 60 | `type_validate` | inf / min / max out-of-range values set to null | on |
+| 70 | `dedupe` | deduplicate by keys | **off** |
+| 90 | `output` | select columns by contract; non-required missing columns filled empty, no warning by default | on |
+| 95 | `sort` | multi-field sorting by contract | on |
 
-内置步骤从 `ctx.rules` / `ctx.contract` / `params` 读取参数，**不再读全局配置树**。
+Built-in steps read their parameters from `ctx.rules` / `ctx.contract` / `params`, **no longer from the global configuration tree**.
 
-**`output` 的参数**：`warn_on_missing: bool = False`（默认不告警）。非 required 缺列一律补空列；是否产生 warning 由该参数控制，不再全局告警。
+**`output` parameters**: `warn_on_missing: bool = False` (no warning by default). Non-required missing columns are always filled with an empty column; whether a warning is produced is controlled by this parameter, instead of warning globally.
 
-### 6.4 去重（`dedupe`，默认关闭）
+### 6.4 Deduplication (`dedupe`, disabled by default)
 
-- 内置为第 12 个 middleware，order=70，`enabled=False`。开启方式见 6.2。
-- **重复行的定义与处理方式全部由 params 控制**：
-  - `keys: tuple[str, ...]`——判重列；为空时回退到 `Contract.keys`；
-  - `scope: Literal["keys", "all_columns"]`——按指定列判重，还是按整行判重；
-  - `strategy: Literal["first", "last", "error"]`——保留首条 / 保留末条 / 发现重复即报错；
-  - `warn: bool`——是否把去重行数写入报告。
-- 开启但 `keys` 与 `Contract.keys` 都为空 → preflight 报错（无法定义"重复"）。
-- `duplicates_removed` 统计由它写入；未开启时该指标不出现。同一引擎因此可同时服务"允许重复的流水型数据"和"严格唯一的基础表"。
+- Built in as the 12th middleware, order=70, `enabled=False`. See 6.2 for how to enable it.
+- **The definition and handling of duplicate rows are entirely controlled by params**:
+  - `keys: tuple[str, ...]` — the columns used for duplicate detection; when empty, falls back to `Contract.keys`;
+  - `scope: Literal["keys", "all_columns"]` — deduplicate by the specified columns or by the whole row;
+  - `strategy: Literal["first", "last", "error"]` — keep the first / keep the last / raise an error on a duplicate;
+  - `warn: bool` — whether to write the number of removed duplicates to the report.
+- Enabled but both `keys` and `Contract.keys` are empty → preflight error (there is no way to define "duplicate").
+- The `duplicates_removed` statistic is written by it; this metric does not appear when it is disabled. Thus the same engine can serve both "stream-type data that allows duplicates" and "strictly unique base tables".
 
-### 6.5 用户 middleware 目录
+### 6.5 User middleware directory
 
-`load_middlewares_from_dir(path)`：扫描目录下带 `@middleware` 标记的 Python 函数，返回 `MiddlewareSpec`。它是**代码加载 helper**，不是数据文件发现；是否注册由调用方决定。同名冲突不在加载阶段吞掉——`register()` 会立即抛 `CleanerRuleError`，上层启动时告警并退出。
+`load_middlewares_from_dir(path)`: scans the directory for Python functions marked with `@middleware` and returns `MiddlewareSpec`. It is a **code-loading helper**, not data-file discovery; whether to register is up to the caller. Duplicate-name conflicts are not swallowed at load time — `register()` throws `CleanerRuleError` immediately, and the upper layer warns and exits at startup.
 
-专属规则（涨跌停无效值、黄金主力合约过滤、交易日历时间戳、股票代码市场推断、源侧补 symbol 等）应改写为无业务标识的通用 middleware 后放到这个目录，由上层按需注册。
+Source-specific rules (invalid limit-up / limit-down values, gold main-contract filtering, trading-calendar timestamps, stock-code market inference, source-side symbol backfill, etc.) should be rewritten as generic middleware without business identifiers, placed in this directory and registered by the upper layer as needed.
 
-### 6.6 动作注册表
+### 6.6 Action registry
 
-`register_action(name, fn)` 扩展 `field_transform` 的可用动作。内置动作：`symbol_to_standard` / `date_to_compact` / `datetime_to_compact` / `zero_to_nan` / `symbol_suffix` / `us_symbol_suffix` / `float_to_compact`。未知动作在 preflight 报错，不是运行期告警。
+`register_action(name, fn)` extends the available actions for `field_transform`. Built-in actions: `symbol_to_standard` / `date_to_compact` / `datetime_to_compact` / `zero_to_nan` / `symbol_suffix` / `us_symbol_suffix` / `float_to_compact`. Unknown actions raise an error in preflight, not a runtime warning.
 
 ---
 
-## 7. 性能设计
+## 7. Performance design
 
-| 问题（现状） | 新库方案 |
+| Problem (current state) | New library approach |
 |---|---|
-| 每个 raw 文件读一次，多分叉在同帧上 copy | 单文件只读一次；按契约推导列裁剪 |
-| 专属规则用 `df.apply(axis=1)` 逐行处理 | 不进库；用户改写时建议向量化 |
-| 每次遍历注册表排序 | 注册表按注册顺序缓存排序结果；`resolve` 先过滤 disabled 再排序 |
-| formula 依赖字段每次重新正则提取 | preflight 阶段解析并缓存 |
-| middleware 失败后继续跑 | 默认 strict 快速失败 |
+| each raw file is read once and multiple forks copy from the same frame | a single file is read once; column pruning is derived from contracts |
+| source-specific rules use `df.apply(axis=1)` row by row | not in the library; vectorization is recommended when rewriting them |
+| the registry is sorted on every traversal | the registry caches the sorted result by registration order; `resolve` filters disabled entries before sorting |
+| formula dependency fields are re-extracted by regex every time | parsed and cached during preflight |
+| execution continues after a middleware failure | strict fail-fast by default |
 
 ---
 
-## 8. 正确性设计
+## 8. Correctness design
 
-| 现状问题 | 新库对策 |
+| Current problem | New library countermeasure |
 |---|---|
-| 非配置/非校验异常被降级为 warning，可能静默产出脏数据 | 默认严格失败；宽松模式必须标记 `degraded=True` |
-| `CleanReport.save()` 从未被调用 | 库不落盘；`to_dict()` 完整可序列化，上层决定落哪里 |
-| `duplicates_removed` / `nulls_backfilled` / `validation_errors` 无写入方 | 只保留有明确写入方的统计；`duplicates_removed` 由 `dedupe` 写入，未开启则不出现 |
-| 契约从全局配置树读取，易被外部改动 | 不可变值对象注入；执行期不读全局配置 |
-| `output` 缺列静默补 None | 按 `FieldSpec.required` 三态推导：required 报错，非 required 补空；告警由 output 的 `warn_on_missing` 参数控制，默认不告警 |
-| meta hash 基于写出文件 | 改为基于 DataFrame 内容，与格式/压缩无关 |
-| 违规处理语义不一 | 统一 `ViolationAction`（null/flag/reject） |
+| non-config / non-validation exceptions are downgraded to warnings, possibly silently producing dirty data | strict failure by default; lenient mode must mark `degraded=True` |
+| `CleanReport.save()` is never called | the library does not persist; `to_dict()` is fully serializable and the upper layer decides where to persist |
+| `duplicates_removed` / `nulls_backfilled` / `validation_errors` have no writers | keep only statistics with a clear writer; `duplicates_removed` is written by `dedupe`, absent when it is disabled |
+| contracts are read from the global configuration tree and are easily mutated externally | immutable value objects are injected; no global config reads during execution |
+| `output` silently fills missing columns with None | derive behavior from the `FieldSpec.required` tri-state: required → error, non-required → empty; warnings are controlled by the output's `warn_on_missing` parameter, no warning by default |
+| meta hash is based on the written file | changed to be based on DataFrame content, independent of format / compression |
+| inconsistent violation-handling semantics | unified `ViolationAction` (null / flag / reject) |
 
 ---
 
-## 9. 与上层集成（伪代码）
+## 9. Integration with the upper layer (pseudocode)
 
 ```python
-# 上层：解析配置（不在库内）
+# Upper layer: parse config (not inside the library)
 contracts = {name: build_contract(cfg) for name, cfg in cfg_contracts.items()}
 rules = parse_rules(cfg_adapter)
 
-# 上层：发现单个文件（不在库内）；多文件合并也在这里
+# Upper layer: discover a single file (not inside the library); multi-file merging is also here
 path = discover_single_parquet(...)
 
-# 上层：准备 middleware（不在库内决定业务规则）
+# Upper layer: prepare middleware (business rules are not decided in the library)
 registry = MiddlewareRegistryImpl()
-registry.builtins()                          # 12 个，dedupe 默认关
+registry.builtins()                          # 12 steps, dedupe off by default
 for spec in load_middlewares_from_dir(Path("my_middlewares/")):
     registry.register(spec)
 
-# 调用引擎（库边界）；需要时按请求覆盖 middleware
+# Call the engine (library boundary); override middleware per request when needed
 engine = CleaningEngine(registry)
 result = engine.clean(CleanRequest(
     input=path,
@@ -362,7 +364,7 @@ result = engine.clean(CleanRequest(
     ),
 ))
 
-# 上层：持久化（不在库内）
+# Upper layer: persistence (not inside the library)
 for out in result.outputs:
     if out.status == "success":
         write_parquet(out.data, path_for(out.output_key))
@@ -373,55 +375,55 @@ write_clean_done(result)
 
 ---
 
-## 10. 迁移路线建议
+## 10. Migration roadmap
 
-1. **冻结值对象**：按本接口定义落地 `Contract` / `Rules` / `CleanReport` / `CleanMeta` / 异常 / `MiddlewareOverride`；上层写适配函数从现有 JSON 构造。
-2. **迁移 `steps.py` 的 11 个通用步骤**：逐个把 `get_config` 换成 `ctx.rules` / `ctx.contract` / `params`；order 不变。
-3. **实现去重步骤**：新增 `dedupe(70)`，按 6.4 的 params 语义实现，默认关闭。
-4. **切换引擎**：`CleanTask` 改造为 `CleaningEngine`（单文件输入 + 分叉 + order 跑链）；用 golden test 对比新旧 DataFrame。
-5. **专属规则外移**：把 9 个专属模块改写为无业务标识的通用 middleware，放到上层目录。
-6. **上层收口 IO 与业务**：门面、断点、CLI、退出码、写盘全部留在 darwin-fetch。
+1. **Freeze the value objects**: implement `Contract` / `Rules` / `CleanReport` / `CleanMeta` / exceptions / `MiddlewareOverride` according to this interface; the upper layer writes adapter functions to construct them from the existing JSON.
+2. **Migrate the 11 generic steps in `steps.py`**: replace `get_config` with `ctx.rules` / `ctx.contract` / `params` one by one; orders stay the same.
+3. **Implement the dedupe step**: add `dedupe(70)`, implement it with the 6.4 params semantics, disabled by default.
+4. **Switch engines**: refactor `CleanTask` into `CleaningEngine` (single-file input + forking + order-based chain); compare old and new DataFrames with golden tests.
+5. **Move source-specific rules out**: rewrite the 9 specific modules as generic middleware without business identifiers and place them in the upper-layer directory.
+6. **Upper layer takes over IO and business logic**: the facade, breakpoints, CLI, exit codes and persistence all remain in darwin-fetch.
 
-### 10.1 决策状态
+### 10.1 Decision status
 
-1. **已定**：0 行输出与校验失败一样按错误路径处理——抛 `CleanerDataEmptyError`，`Status` 不含 `empty`。
-2. **已定**：库只返回 DataFrame；任何文件格式（parquet / csv 等）的序列化与写盘由上层 writer 负责。
-3. **已定**：同名 middleware 在注册阶段立即抛 `CleanerRuleError`（启动期失败），不覆盖、不静默跳过；上层应用启动时告警并退出。
-4. **已定**：缺列行为由 `FieldSpec.required` 三态决定，sort/keys 自动推导为 required；非 required 补空、默认不告警（见 5.1 / 6.3）。
-5. **已定**：`Contract.keys` 声明唯一行键；去重内置为 `dedupe(70)` 默认关闭，重复行的定义与处理由 params 控制（见 6.4）。
-6. **已定**：middleware 采用声明式 `params` + 强类型 Options 约定；`enabled` 注册期开关 + 请求级 overrides，注册表层跳过（见 6.1 / 6.2）。
+1. **Decided**: zero-row output is handled as an error just like a validation failure — throw `CleanerDataEmptyError`; `Status` does not include `empty`.
+2. **Decided**: the library only returns DataFrames; serialization and persistence of any file format (parquet / csv / etc.) are the upper-layer writer's responsibility.
+3. **Decided**: middleware with duplicate names throw `CleanerRuleError` immediately at registration (a startup-time failure), with no overwrite and no silent skip; the upper-layer application warns and exits at startup.
+4. **Decided**: missing-column behavior is determined by the `FieldSpec.required` tri-state, with sort / keys auto-derived as required; non-required columns are filled empty with no warning by default (see 5.1 / 6.3).
+5. **Decided**: `Contract.keys` declares unique row keys; deduplication is built in as `dedupe(70)` and disabled by default, with the definition and handling of duplicate rows controlled by params (see 6.4).
+6. **Decided**: middleware uses declarative `params` plus a strongly-typed Options convention; `enabled` is a registration-time switch combined with request-level overrides and is skipped at the registry layer (see 6.1 / 6.2).
 
-### 10.2 缺列处理：为什么取消 `missing_output_policy`
+### 10.2 Missing-column handling: why `missing_output_policy` was removed
 
-现有 `steps.py` 的 `output` 步骤（order=90）有两种不同情况：
-- 输出列在契约 `fields` 里**未定义** → 直接抛 `CleanerConfigError`（硬错误）；
-- 输出列在契约里**已定义**，但输入 DataFrame 中**没有这一列** → 静默执行 `df[field] = None`，产出全空列。
+The `output` step (order=90) in the existing `steps.py` has two distinct cases:
+- an output column is **undefined** in the contract `fields` → throw `CleanerConfigError` directly (a hard error);
+- an output column is **defined** in the contract, but the input DataFrame **does not have that column** → silently execute `df[field] = None`, producing an all-null column.
 
-原设计想用一个全局 `null/reject` 开关控制第二种情况，但这是错误的抽象：同一份输出里，有的列（如扩展字段、可选指标）缺了补空有意义，有的列（如排序键、唯一行键、核心业务字段）缺了必须报错。全局策略无法同时表达两者。
+The original design tried to control the second case with a global `null/reject` switch, but that is the wrong abstraction: within the same output, some columns (e.g. extension fields, optional metrics) meaningfully become empty when absent, while others (e.g. sort keys, unique row keys and core business fields) must raise an error when absent. A global policy cannot express both at once.
 
-现在改为**逐列三态声明**：显式 `required=True` 报错、显式 `False` 补空、未声明时由 sort/keys 推导。告警不再是默认行为，而由 `output` 的 `warn_on_missing` 参数按需开启。`CleanOptions` 里没有 `missing_output_policy` 字段。
+It is now changed to a **per-column tri-state declaration**: explicit `required=True` raises an error, explicit `False` fills an empty column, and undeclared columns are derived from sort / keys. Warning is no longer the default behavior but is enabled on demand via the `output` parameter `warn_on_missing`. There is no `missing_output_policy` field in `CleanOptions`.
 
-### 10.3 唯一行与重复行
+### 10.3 Unique rows and duplicate rows
 
-- `Contract.keys` 为复合列元组；**空 = 不区分唯一行，允许重复行**（对应当前 darwin-fetch 的实际行为：全仓无去重代码，`duplicates_removed` 是永远为 0 的死指标）。
-- 非空时，`keys` 每列被推导为 `required=True` 且必须在 `output` 中；这是"数据应该是唯一的"这一契约声明。
-- `dedupe(70)` 内置但默认关闭。开启后按 params 定义的 `keys` / `scope` 判定重复，按 `strategy` 处理（first/last/error），并写入 `duplicates_removed`。
-- 因此同一引擎可同时服务"允许重复的流水/事件型数据"和"严格唯一的基础表"。
+- `Contract.keys` is a tuple of compound columns; **empty = no unique-row distinction, duplicate rows allowed** (corresponding to the current actual behavior of darwin-fetch: there is no deduplication code anywhere in the repository and `duplicates_removed` is a dead metric permanently equal to 0).
+- When non-empty, each `keys` column is derived as `required=True` and must be present in `output`; this is the contract declaration that "the data should be unique".
+- `dedupe(70)` is built in but disabled by default. When enabled, duplicates are determined by the `keys` / `scope` defined in params, handled according to `strategy` (first / last / error), and `duplicates_removed` is written.
+- Therefore the same engine can serve both "stream / event-type data that allows duplicates" and "strictly unique base tables".
 
 ---
 
-## 11. 接口文件索引
+## 11. Interface file index
 
-| 文件 | 内容 |
+| File | Contents |
 |---|---|
-| `src/darwin_cleaner/contract.py` | `Contract`（含 `keys`、`is_required`、`dedupe_keys`）/ `FieldSpec`（含三态 `required`）/ `TypeSpec` / `FillSpec` / `SortSpec` |
+| `src/darwin_cleaner/contract.py` | `Contract` (with `keys`, `is_required`, `dedupe_keys`) / `FieldSpec` (with tri-state `required`) / `TypeSpec` / `FillSpec` / `SortSpec` |
 | `src/darwin_cleaner/rules.py` | `Rules` / `TransformSpec` / `JsonExtractSpec` / `RowForkSpec` / `ForkPlan` |
-| `src/darwin_cleaner/request.py` | `InputData` / `ReadOptions` / `CleanOptions`（含 `middleware_overrides`）/ `CleanRequest` |
+| `src/darwin_cleaner/request.py` | `InputData` / `ReadOptions` / `CleanOptions` (with `middleware_overrides`) / `CleanRequest` |
 | `src/darwin_cleaner/context.py` | `CleanContext` / `Logger` |
 | `src/darwin_cleaner/results.py` | `CleanOutput` / `CleanMeta` / `CleanReport` / `CleaningStats` / `ValidationIssue` / `CleanResult` |
-| `src/darwin_cleaner/middleware.py` | `MiddlewareFn` / `MiddlewareSpec`（含 `params` / `enabled`）/ `MiddlewareOverride` / `middleware` / `builtin_middlewares` / `load_middlewares_from_dir` / `MiddlewareRegistry` |
-| `src/darwin_cleaner/engine.py` | `CleaningEngine` / `CleanPlan` / `CleanStep`（含 `params`）/ `clean()` |
-| `src/darwin_cleaner/exceptions.py` | 异常层次 |
-| `src/darwin_cleaner/__init__.py` | 公共 API 导出 |
+| `src/darwin_cleaner/middleware.py` | `MiddlewareFn` / `MiddlewareSpec` (with `params` / `enabled`) / `MiddlewareOverride` / `middleware` / `builtin_middlewares` / `load_middlewares_from_dir` / `MiddlewareRegistry` |
+| `src/darwin_cleaner/engine.py` | `CleaningEngine` / `CleanPlan` / `CleanStep` (with `params`) / `clean()` |
+| `src/darwin_cleaner/exceptions.py` | exception hierarchy |
+| `src/darwin_cleaner/__init__.py` | public API exports |
 
-> 接口文件只定义类型签名与语义契约，方法体均为占位，不含实现逻辑。
+> Interface files define only type signatures and semantic contracts; method bodies are placeholders and contain no implementation logic.

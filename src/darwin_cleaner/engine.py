@@ -1,10 +1,11 @@
 # src/darwin_cleaner/engine.py
 
 """
-清洗引擎入口。
+Cleaning engine entry point.
 
-职责边界：读取单个 parquet -> 分叉 -> 按 order 跑链 -> 返回数据与 meta。
-不做：配置加载、文件发现/合并、调度、断点、写 parquet/meta、CLI 退出码。
+Scope: read a single parquet -> fork -> run the chain by order -> return data
+and meta. Out of scope: configuration loading, file discovery/merging,
+scheduling, checkpoints, writing parquet/meta, CLI exit codes.
 """
 
 from __future__ import annotations
@@ -34,12 +35,12 @@ from darwin_cleaner.results import (
 if TYPE_CHECKING:
     pass
 
-ENGINE_VERSION = "0.4.0"
+ENGINE_VERSION = "0.4.1"
 
 
 @dataclass(frozen=True)
 class CleanStep:
-    """执行计划中的一步（按 order 排列）。"""
+    """One step in the execution plan (ordered by order)."""
 
     name: str
     order: int
@@ -49,7 +50,7 @@ class CleanStep:
 
 @dataclass(frozen=True)
 class CleanPlan:
-    """单个分叉的可审查执行计划。"""
+    """Auditable execution plan for a single fork."""
 
     output_key: str
     steps: tuple[CleanStep, ...]
@@ -58,7 +59,7 @@ class CleanPlan:
 
 
 def _input_hash(df: pd.DataFrame, algorithm: str) -> str:
-    """基于 DataFrame 内容计算稳定 hash（与格式/压缩无关）。"""
+    """Compute a stable hash from DataFrame content (independent of format/compression)."""
     import hashlib
 
     h = hashlib.new(algorithm)
@@ -68,7 +69,7 @@ def _input_hash(df: pd.DataFrame, algorithm: str) -> str:
 
 
 def _signature(*parts: Any) -> str:
-    """对契约 / 规则 / 注册表指纹生成稳定组合指纹。"""
+    """Generate a stable combined fingerprint from contract / rules / registry fingerprints."""
     import hashlib
     import json
 
@@ -78,22 +79,22 @@ def _signature(*parts: Any) -> str:
 
 class CleaningEngine:
     """
-    清洗引擎。
+    Cleaning engine.
 
-    使用方式：
+    Usage:
         registry = MiddlewareRegistryImpl()
         registry.builtins()
         engine = CleaningEngine(registry)
         result = engine.clean(request)
 
-    所有产出都在内存中；上层自行决定如何持久化。
+    All outputs are produced in memory; the upper layer decides how to persist them.
     """
 
     def __init__(self, registry: MiddlewareRegistry) -> None:
         self._registry = registry
 
     def build_plan(self, request: CleanRequest) -> tuple[CleanPlan, ...]:
-        """构建并校验执行计划，不执行、不读数据。可用于审查与调试。"""
+        """Build and validate the execution plan without executing or reading data. Can be used for review and debugging."""
         self._preflight(request)
         resolved = self._registry.resolve(request.options.middleware_overrides)
         steps = tuple(
@@ -111,12 +112,13 @@ class CleaningEngine:
 
     def clean(self, request: CleanRequest) -> CleanResult:
         """
-        执行清洗。
+        Execute cleaning.
 
-        流程：preflight 校验 -> 读取单个输入 -> 行分叉/列分叉 ->
-        逐分叉按 order 跑链 -> 生成 meta -> 汇总。
+        Flow: preflight validation -> read a single input -> row fork / column fork ->
+        run the chain by order for each fork -> generate meta -> aggregate.
 
-        异常通过 darwin_cleaner.exceptions 抛出，不映射为退出码。
+        Exceptions are raised through darwin_cleaner.exceptions and are not mapped
+        to exit codes.
         """
         started = datetime.now(timezone.utc).isoformat()
         warnings: list[str] = []
@@ -134,7 +136,7 @@ class CleaningEngine:
             )
             plans = request.rules.to_fork_plans()
             if not plans:
-                # 无 filters / outputs 时，退化为单组列分叉：产出全部已注入契约
+                # With no filters / outputs, fall back to a single column fork: produce all injected contracts
                 from darwin_cleaner.rules import ForkPlan
 
                 plans = (ForkPlan(key="all", output_names=tuple(request.contracts)),)
@@ -149,7 +151,7 @@ class CleaningEngine:
         except (CleanerConfigError, CleanerDataNotFoundError, CleanerDataEmptyError) as exc:
             errors.append(str(exc))
         except Exception as exc:
-            errors.append(f"清洗失败: {exc}")
+            errors.append(f"Cleaning failed: {exc}")
 
         finished = datetime.now(timezone.utc).isoformat()
         status = "failed" if errors else "success"
@@ -168,40 +170,42 @@ class CleaningEngine:
     # ------------------------------------------------------------
 
     def _preflight(self, request: CleanRequest) -> None:
-        """执行前校验请求的自洽性；失败即抛 CleanerConfigError。"""
+        """Validate the request's self-consistency before execution; raises CleanerConfigError on failure."""
         if not request.contracts:
-            raise CleanerConfigError("contracts 不能为空")
+            raise CleanerConfigError("contracts must not be empty")
         for name, contract in request.contracts.items():
             if not contract.output:
-                raise CleanerConfigError(f"契约 {name} 的 output 不能为空")
+                raise CleanerConfigError(f"Contract {name} must have a non-empty output")
             missing_def = [f for f in contract.output if f not in contract.fields]
             if missing_def:
                 raise CleanerConfigError(
-                    f"契约 {name} 的 output 字段未在 fields 中定义: {missing_def}"
+                    f"Output fields of contract {name} are not defined in fields: {missing_def}"
                 )
             missing_keys = [k for k in contract.keys if k not in contract.output]
             if missing_keys:
                 raise CleanerConfigError(
-                    f"契约 {name} 的 keys 字段不在 output 中: {missing_keys}"
+                    f"Keys fields of contract {name} are not in output: {missing_keys}"
                 )
         for plan in request.rules.to_fork_plans():
             unknown = [n for n in plan.output_names if n not in request.contracts]
             if unknown:
                 raise CleanerConfigError(
-                    f"分叉 {plan.key} 引用了未知输出名: {unknown}"
+                    f"Fork {plan.key} references unknown output names: {unknown}"
                 )
 
     # ------------------------------------------------------------
-    # 读取与分叉
+    # Read and fork
     # ------------------------------------------------------------
 
     def _read_input(self, request: CleanRequest) -> pd.DataFrame:
         """
-        读取单个 parquet 或接收内存 DataFrame。
+        Read a single parquet or accept an in-memory DataFrame.
 
-        列裁剪只用于 parquet 读取优化：需求列与文件实际列取交集，
-        避免读取不存在的列报错。内存 DataFrame 不裁剪——字段映射、公式等
-        步骤可能依赖 output 之外的中间列，裁剪会破坏清洗链。
+        Column pruning is only used to optimize parquet reads: the intersection of
+        required columns and actual file columns is taken, avoiding errors from
+        reading non-existent columns. In-memory DataFrames are not pruned --
+        steps such as field mapping and formulas may depend on intermediate columns
+        outside output, and pruning would break the cleaning chain.
         """
         source = request.input
         if isinstance(source, pd.DataFrame):
@@ -222,14 +226,14 @@ class CleaningEngine:
             try:
                 df = pd.read_parquet(source, columns=read_cols)
             except Exception as exc:
-                raise CleanerDataNotFoundError(f"读取 parquet 失败: {source}: {exc}") from exc
+                raise CleanerDataNotFoundError(f"Failed to read parquet: {source}: {exc}") from exc
 
         if df.empty:
-            raise CleanerDataEmptyError("输入数据为 0 行")
+            raise CleanerDataEmptyError("Input data has 0 rows")
         return df
 
     def _derive_columns(self, request: CleanRequest) -> tuple[str, ...]:
-        """按本次涉及契约的 output / keys / sort 与规则字段推导读取列。"""
+        """Derive columns to read from the output / keys / sort of the contracts involved and the rule fields."""
         needed: list[str] = []
         for name in request.contracts:
             contract = request.contracts[name]
@@ -249,7 +253,7 @@ class CleaningEngine:
 
     @staticmethod
     def _apply_row_filter(df: pd.DataFrame, plan: Any) -> pd.DataFrame:
-        """按 RowForkSpec 过滤行；无配置则全量。"""
+        """Filter rows by RowForkSpec; no configuration means keep all rows."""
         spec = plan.row_filter
         if spec is None or not spec.field:
             return df
@@ -265,7 +269,7 @@ class CleaningEngine:
         return df[mask].reset_index(drop=True)
 
     # ------------------------------------------------------------
-    # 单分叉执行
+    # Single-fork execution
     # ------------------------------------------------------------
 
     def _run_one(
@@ -276,7 +280,7 @@ class CleaningEngine:
         resolved: tuple[Any, ...],
         signature: str,
     ) -> CleanOutput:
-        """对单个分叉跑完整链，产出 CleanOutput。"""
+        """Run the full chain for a single fork and produce a CleanOutput."""
         contract = request.contracts[output_name]
         report = CleanReport(
             output_key=output_name,
@@ -301,16 +305,16 @@ class CleaningEngine:
                 except Exception as exc:
                     if request.options.strict:
                         raise CleanerValidationError(
-                            f"middleware {spec.name} 失败: {exc}"
+                            f"middleware {spec.name} failed: {exc}"
                         ) from exc
-                    report.add_warning(f"middleware {spec.name} 失败: {exc}")
+                    report.add_warning(f"middleware {spec.name} failed: {exc}")
                     report.degraded = True
                     continue
                 if result is not None:
                     current = result
 
             if current.empty:
-                raise CleanerDataEmptyError(f"输出 {output_name} 为 0 行")
+                raise CleanerDataEmptyError(f"Output {output_name} has 0 rows")
 
             report.bump_stat("rows_out", len(current))
             report.status = "success"
@@ -345,7 +349,7 @@ class CleaningEngine:
             report.finish()
 
     # ------------------------------------------------------------
-    # 指纹
+    # Fingerprints
     # ------------------------------------------------------------
 
     @staticmethod
@@ -400,7 +404,7 @@ def clean(
     *,
     registry: MiddlewareRegistry | None = None,
 ) -> CleanResult:
-    """便捷函数：使用默认（内置）注册表执行一次清洗。"""
+    """Convenience function: run one cleaning pass with the default (built-in) registry."""
     if registry is None:
         registry = MiddlewareRegistryImpl()
         registry.builtins()

@@ -1,10 +1,12 @@
 # src/darwin_cleaner/results.py
 
 """
-结果值对象：引擎只在内存中产出这些对象，不写任何文件。
+Result value objects: the engine only produces these objects in memory and writes
+no files.
 
-不含 source / clean_type / date 等业务标识，也不含输出路径与断点信息。
-上层负责把 data 写成 parquet，并自行补充业务字段与路径信息。
+Contains no business identifiers such as source / clean_type / date, and no
+output paths or checkpoint information. The upper layer writes data to parquet
+and adds business fields and path information itself.
 """
 
 from __future__ import annotations
@@ -22,10 +24,10 @@ Status = Literal["pending", "success", "failed", "skipped"]
 @dataclass(frozen=True)
 class CleaningStats:
     """
-    清洗统计。
+    Cleaning statistics.
 
-    每项统计必须由明确的规则写入；无写入方的字段不应出现在报告中，
-    以免形成"永远为 0"的假指标。
+    Each statistic must be written by an explicit rule; fields without a writer
+    should not appear in the report, to avoid "always zero" fake metrics.
     """
 
     rows_in: int = 0
@@ -40,13 +42,13 @@ class CleaningStats:
     validated_fields: Mapping[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        """序列化为可写 JSON 的字典。"""
+        """Serialize to a JSON-writable dict."""
         return {f.name: getattr(self, f.name) for f in fields(self)}
 
 
 @dataclass(frozen=True)
 class ValidationIssue:
-    """行级违规样本。"""
+    """Sample row-level violation."""
 
     row_index: int
     field: str
@@ -56,17 +58,19 @@ class ValidationIssue:
     action: str
 
     def to_dict(self) -> dict[str, Any]:
-        """序列化为可写 JSON 的字典。"""
+        """Serialize to a JSON-writable dict."""
         return {f.name: getattr(self, f.name) for f in fields(self)}
 
 
 @dataclass(frozen=True)
 class CleanMeta:
     """
-    数据自身元信息（不含业务标识、路径、写入时间、断点反查）。
+    Metadata about the data itself (no business identifiers, paths, write times,
+    or checkpoint lookups).
 
-    data_hash 基于 DataFrame 内容计算，与落盘格式/压缩参数无关；
-    rule_signature 由契约 + 规则 + middleware 注册表指纹组成。
+    data_hash is computed from DataFrame content and is independent of the
+    persistence format / compression parameters; rule_signature is composed of
+    the contract + rules + middleware registry fingerprints.
     """
 
     output_key: str
@@ -80,7 +84,7 @@ class CleanMeta:
     degraded: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        """序列化为可写 JSON 的字典。"""
+        """Serialize to a JSON-writable dict."""
         return {
             "output_key": self.output_key,
             "rows": self.rows,
@@ -96,7 +100,7 @@ class CleanMeta:
 
 @dataclass
 class CleanReport:
-    """单个分叉的过程审计报告；是否落盘由上层决定。"""
+    """Process audit report for a single fork; whether to persist it is decided by the upper layer."""
 
     output_key: str
     status: Status = "pending"
@@ -113,11 +117,11 @@ class CleanReport:
     max_validation_samples: int = 100
 
     def start(self) -> None:
-        """记录开始时间。"""
+        """Record the start time."""
         self.started_at = datetime.now(timezone.utc).isoformat()
 
     def finish(self) -> None:
-        """记录结束时间与耗时。"""
+        """Record the end time and duration."""
         self.finished_at = datetime.now(timezone.utc).isoformat()
         if self.started_at is not None:
             start = datetime.fromisoformat(self.started_at)
@@ -125,26 +129,26 @@ class CleanReport:
             self.duration_seconds = (end - start).total_seconds()
 
     def add_validation_error(self, issue: ValidationIssue) -> None:
-        """添加行级违规样本，超过上限后丢弃。"""
+        """Add a row-level violation sample, discarding it once the limit is reached."""
         if len(self.validation_errors) < self.max_validation_samples:
             self.validation_errors.append(issue)
 
     def add_warning(self, msg: str) -> None:
-        """添加一条告警。"""
+        """Add a warning."""
         self.warnings.append(msg)
 
     def add_error(self, msg: str) -> None:
-        """添加一条错误。"""
+        """Add an error."""
         self.errors.append(msg)
 
     def bump_stat(self, name: str, amount: int = 1) -> None:
-        """递增一个整数统计项（未知字段忽略）。"""
+        """Increment an integer statistic (unknown fields are ignored)."""
         current = getattr(self.stats, name, None)
         if isinstance(current, int):
             self.stats = replace(self.stats, **{name: current + amount})
 
     def bump_mapping(self, name: str, key: str, amount: int = 1) -> None:
-        """递增一个映射统计项（未知字段忽略）。"""
+        """Increment a mapping statistic (unknown fields are ignored)."""
         current = getattr(self.stats, name, None)
         if isinstance(current, Mapping):
             updated = dict(current)
@@ -152,7 +156,7 @@ class CleanReport:
             self.stats = replace(self.stats, **{name: updated})
 
     def to_dict(self) -> dict[str, Any]:
-        """序列化为可写 JSON 的字典。"""
+        """Serialize to a JSON-writable dict."""
         return {
             "output_key": self.output_key,
             "status": self.status,
@@ -169,7 +173,7 @@ class CleanReport:
 
 @dataclass(frozen=True)
 class CleanOutput:
-    """单个分叉的内存产出。0 行输出按错误路径处理，不产生 special status。"""
+    """In-memory output of a single fork. A 0-row output is handled as an error path and produces no special status."""
 
     output_key: str
     status: Status
@@ -180,7 +184,7 @@ class CleanOutput:
 
 @dataclass(frozen=True)
 class CleanResult:
-    """一次 CleanRequest 的整体结果。"""
+    """Overall result of one CleanRequest."""
 
     outputs: tuple[CleanOutput, ...] = ()
     status: Status = "pending"
@@ -192,11 +196,11 @@ class CleanResult:
 
     @property
     def success(self) -> bool:
-        """所有分叉都成功时返回 True。"""
+        """Return True when all forks succeed."""
         return bool(self.outputs) and all(o.status == "success" for o in self.outputs)
 
     def to_dict(self) -> dict[str, Any]:
-        """序列化为可写 JSON 的字典。"""
+        """Serialize to a JSON-writable dict."""
         return {
             "outputs": [
                 {

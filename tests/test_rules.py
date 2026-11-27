@@ -1,4 +1,4 @@
-"""规则值对象测试：分叉计划解析。"""
+"""Rules value objects: fork plan resolution."""
 
 from darwin_cleaner import ForkPlan, RowForkSpec, Rules
 

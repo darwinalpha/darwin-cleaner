@@ -1,10 +1,11 @@
 # src/darwin_cleaner/rules.py
 
 """
-规则值对象：描述"原始字段如何映射到契约"。
+Rule value objects: describe "how raw fields map to the contract".
 
-由上层解析后注入，替代 middleware 内的全局配置读取。
-本模块不含任何数据源标识、业务类型标识。
+Parsed by the upper layer and injected, replacing global configuration reads
+inside middleware. This module contains no data source identifiers or business
+type identifiers.
 """
 
 from __future__ import annotations
@@ -18,11 +19,11 @@ TransformKind = Literal["value", "factor", "action"]
 @dataclass(frozen=True)
 class TransformSpec:
     """
-    字段转换声明，kind 决定读取哪个参数。
+    Field transform declaration; kind determines which parameter is read.
 
-    value  —— 常量赋值，可创建新列
-    factor —— 乘以系数，要求字段已存在
-    action —— 调用注册的转换动作，要求字段已存在
+    value  -- assign a constant, can create a new column
+    factor -- multiply by a factor, the field must already exist
+    action -- call a registered transform action, the field must already exist
     """
 
     kind: TransformKind
@@ -33,7 +34,7 @@ class TransformSpec:
 
 @dataclass(frozen=True)
 class JsonExtractSpec:
-    """从 dict / JSON 列按路径提取字段。"""
+    """Extract fields from a dict / JSON column by path."""
 
     column: str
     path: tuple[str, ...] = ()
@@ -42,11 +43,12 @@ class JsonExtractSpec:
 @dataclass(frozen=True)
 class RowForkSpec:
     """
-    行分叉组。
+    Row fork group.
 
-    field 指向的列不存在时不过滤（全量通过）。
-    regex 与 exclude_regex 可同时存在：两者都满足才算命中。
-    outputs 是输出名（对应请求中 contracts 的键），不是业务类型。
+    If the column pointed to by field does not exist, no filtering is applied
+    (all rows pass). regex and exclude_regex can both be present: a row matches
+    only when both are satisfied. outputs are output names (keys of contracts in
+    the request), not business types.
     """
 
     key: str
@@ -58,7 +60,7 @@ class RowForkSpec:
 
 @dataclass(frozen=True)
 class ForkPlan:
-    """单个分叉的显式执行规格。"""
+    """Explicit execution specification for a single fork."""
 
     key: str
     output_names: tuple[str, ...]
@@ -67,7 +69,7 @@ class ForkPlan:
 
 @dataclass(frozen=True)
 class Rules:
-    """一组通用清洗规则。"""
+    """A set of generic cleaning rules."""
 
     mapping: Mapping[str, str] = field(default_factory=dict)
     value_map: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
@@ -78,10 +80,12 @@ class Rules:
 
     def to_fork_plans(self) -> tuple[ForkPlan, ...]:
         """
-        把 filters / outputs 解析为有序分叉计划。
+        Parse filters / outputs into an ordered list of fork plans.
 
-        - 有 filters：每个非空 outputs 的 RowForkSpec 生成一个计划（保持插入顺序）；
-        - 无 filters 但有 outputs：退化为单组 "all" 的纯列分叉。
+        - With filters: each RowForkSpec with non-empty outputs produces one plan
+          (insertion order preserved);
+        - Without filters but with outputs: fall back to a single column-only
+          fork named "all".
         """
         plans: list[ForkPlan] = []
         if self.filters:
