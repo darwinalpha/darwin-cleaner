@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "darwin-cleaner"
-version = "0.4.4"
+version = "0.4.5"
 description = "Contract- and rules-driven single-file cleaning engine: parquet → row/column forks → ordered middleware chain → data and meta"
 readme = "README.md"
 license = { text = "MIT" }
