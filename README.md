@@ -1,6 +1,6 @@
 # darwin-cleaner
 
-[English](README.md) · [简体中文](README.cn.md)
+[English](https://github.com/darwinalpha/darwin-cleaner/blob/main/README.md) · [简体中文](https://github.com/darwinalpha/darwin-cleaner/blob/main/README.cn.md)
 
 A contract- and rules-driven **single-file cleaning engine**: read one parquet file (or an in-memory DataFrame) → split rows / columns → run middlewares by `order` → return data and meta in memory.
 

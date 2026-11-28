@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "darwin-cleaner"
-version = "0.4.2"
+version = "0.4.3"
 description = "Contract- and rules-driven single-file cleaning engine: parquet → row/column forks → ordered middleware chain → data and meta"
 readme = "README.md"
 license = { text = "MIT" }
@@ -13,6 +13,9 @@ dependencies = [
     "pandas>=2.0",
     "pyarrow>=12",
 ]
+
+[project.urls]
+"Chinese Documentation" = "https://github.com/darwinalpha/darwin-cleaner/blob/main/README.cn.md"
 
 [project.optional-dependencies]
 test = ["pytest>=8"]

@@ -1,6 +1,6 @@
 # darwin-cleaner
 
-English · [简体中文](README.cn.md)
+[English](https://github.com/darwinalpha/darwin-cleaner/blob/main/README.md) · 简体中文
 
 契约与规则驱动的**单文件清洗引擎**：读取一个 parquet（或内存 DataFrame）→ 行分叉 / 列分叉 → 按 order 跑 middleware → 在内存中返回数据与 meta。
 

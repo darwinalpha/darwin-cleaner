@@ -35,7 +35,7 @@ from darwin_cleaner.results import (
 if TYPE_CHECKING:
     pass
 
-ENGINE_VERSION = "0.4.2"
+ENGINE_VERSION = "0.4.3"
 
 
 @dataclass(frozen=True)
